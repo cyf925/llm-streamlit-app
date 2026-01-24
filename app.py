@@ -4,72 +4,90 @@ import time
 import json
 import re
 
-# ===== 你的 4 个模型（必须和 ollama list 一致）=====
+# ===== ollama部署的4个模型 =====
 MODELS = [
-    "qwen2.5:3b",
-    "llama3.2:3b",
-    "phi3:mini",
-    "gemma2:2b",
+    "qwen2.5:7b-instruct-q4_K_M",
+    "llama3.1:8b-instruct-q4_K_M",
+    "gemma2:9b-instruct-q4_K_M",
+    "koesn/mistral-7b-instruct:Q4_0",
 ]
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-
+OLLAMA_URL = "http://localhost:11434/api/chat"
 
 def call_ollama(model: str, prompt: str, timeout: int = 300) -> str:
-    """调用 Ollama /api/generate，返回模型回答文本"""
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": "你是一个严谨、可靠的英语翻译与词汇释义助手。"},
+            {"role": "user", "content": prompt},
+        ],
         "stream": False,
         "options": {
             "temperature": 0,
             "top_p": 0.9,
-            "num_predict": 512,  # 防止输出太短/被截断
+            "num_predict": 512,
         }
     }
     resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("response", "").strip()
+
+    # /api/chat 返回字段是 message.content
+    return (data.get("message", {}) or {}).get("content", "").strip()
+
 
 
 # ✅ 停用词表（用于自动抽取英文关键词时过滤掉无意义高频词）
 STOPWORDS = set("""
-a an the in on at for to of and or but so with without among between into from by as is are was were be been being
+a an the in on at for to can both all of and or but so with without among between into from by as is are was were be been being
 this that these those it its we you they i he she them our your their
 """.split())
 
 
 def extract_keywords(english_text: str, k: int = 6):
     """
-    从英文原文里抽取 k 个关键词（纯英文），保证数量一致
+    ✅ 从英文原文里抽取 k 个关键词（保持英文原样显示）
     规则：只要字母单词，去停用词，按出现频率排序
     """
-    words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", english_text.lower())
-    words = [w for w in words if w not in STOPWORDS and len(w) >= 3]
+    # 保留原文形式（original_words），统计用小写（lower_words）
+    original_words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", english_text)
+    lower_words = [w.lower() for w in original_words]
 
+    # 过滤
+    filtered = [(orig, low) for orig, low in zip(original_words, lower_words)
+                if low not in STOPWORDS and len(low) >= 3]
+
+    if not filtered:
+        return []
+
+    # 统计频率
     freq = {}
-    for w in words:
-        freq[w] = freq.get(w, 0) + 1
+    first_seen = {}  # 记录每个词第一次出现时的原始大小写
+    for orig, low in filtered:
+        freq[low] = freq.get(low, 0) + 1
+        if low not in first_seen:
+            first_seen[low] = orig
 
     # 按 (频率降序, 字母升序) 排序
     sorted_words = sorted(freq.items(), key=lambda x: (-x[1], x[0]))
-    keywords = [w for w, _ in sorted_words[:k]]
 
-    # 如果不足 k 个，补一些原文出现的单词
+    # 输出用原样（first_seen）
+    keywords = [first_seen[low] for low, _ in sorted_words[:k]]
+
+    # 不足 k 个时补齐（按出现顺序）
     if len(keywords) < k:
-        seen = set(keywords)
-        for w in words:
-            if w not in seen:
-                keywords.append(w)
-                seen.add(w)
+        seen = set([w.lower() for w in keywords])
+        for orig, low in filtered:
+            if low not in seen:
+                keywords.append(orig)
+                seen.add(low)
             if len(keywords) >= k:
                 break
 
     return keywords[:k]
 
 
-def build_prompt_fixed_keywords(english_text: str, keywords: list) -> str:
+def build_prompt_keyword_meanings(keywords: list) -> str:
     """
     ✅ 强约束：模型必须按给定 keywords 列表逐个输出释义（顺序一致、数量一致、原词不变）
     """
@@ -91,12 +109,8 @@ def build_prompt_fixed_keywords(english_text: str, keywords: list) -> str:
   "keywords": [
     {{"word": "与输入keywords[0]完全相同", "meaning_zh": "中文释义"}},
     {{"word": "与输入keywords[1]完全相同", "meaning_zh": "中文释义"}}
-  ],
-  "translation_zh": "整段中文翻译"
+  ]
 }}
-
-英文文本如下：
-\"\"\"{english_text}\"\"\"
 """.strip()
 
 
@@ -138,7 +152,29 @@ def try_parse_json(text: str):
     return None
 
 
-# ✅✅✅ 补全机制 1：只补关键词中文释义（更容易成功）
+def get_keyword_meanings(model: str, keywords: list, timeout: int = 180) -> dict:
+    """
+    让某个模型对给定关键词列表逐个给中文释义，返回 dict: {word: meaning_zh}
+    """
+    prompt = build_prompt_keyword_meanings(keywords)
+    out = call_ollama(model, prompt, timeout=timeout)
+    parsed = try_parse_json(out)
+    if not parsed:
+        return {}
+
+    kw_map = {}
+    model_kw = parsed.get("keywords", [])
+    if isinstance(model_kw, list):
+        for item in model_kw:
+            if isinstance(item, dict):
+                w = str(item.get("word", "")).strip()
+                z = str(item.get("meaning_zh", "")).strip()
+                if w:
+                    kw_map[w] = z
+    return kw_map
+
+
+# 补全机制：补全关键词中文释义
 def fill_missing_meanings(model: str, words: list, timeout: int = 180) -> dict:
     """
     给定缺失释义的英文词表，返回 {word: meaning_zh}
@@ -179,7 +215,7 @@ def fill_missing_meanings(model: str, words: list, timeout: int = 180) -> dict:
     return meanings
 
 
-# ✅✅✅ 补全机制 2：只做全文翻译（更稳）
+# 全文翻译，模型单独翻译
 def generate_translation_only(model: str, english_text: str, timeout: int = 180) -> str:
     prompt = f"""
 你是严谨的英译中助手。请只输出中文翻译结果，不要输出任何解释。
@@ -193,10 +229,9 @@ def generate_translation_only(model: str, english_text: str, timeout: int = 180)
 
 # ===== Streamlit 页面 =====
 st.set_page_config(page_title="LLM Translator Comparator", layout="wide")
-st.title("📝 四模型英文翻译对比（关键词释义 + 全文翻译）")
-st.caption("输入一段英文，4 个本地模型会分别给出关键词释义和整段翻译，并标注清楚来源模型。")
+st.title("LLM Translator Comparator")
+st.caption("输入英文文本，系统调用 4 个本地模型分别生成该文本的中文翻译")
 
-# ✅ 打开网页默认空白
 english = st.text_area(
     "请输入英文文本：",
     value="",
@@ -206,68 +241,52 @@ english = st.text_area(
 
 col1, col2 = st.columns([1, 1])
 with col1:
-    k = st.slider("关键词数量", min_value=3, max_value=12, value=6)
+    k = st.slider("关键词数量", min_value=3, max_value=15, value=6)
 with col2:
-    run_btn = st.button("🚀 生成释义与翻译", use_container_width=True)
+    run_btn = st.button("🚀 Click to translate", use_container_width=True)
 
 if run_btn:
     if not english.strip():
         st.warning("请先输入英文文本。")
     else:
-        st.info("正在调用 4 个模型生成结果，请稍等…")
+        st.info("正在调用模型以生成结果，请稍等…")
 
         results = {}
         times = {}
 
-        # ✅ 固定关键词：所有模型使用同一批关键词（数量一致 + 英文原词）
+        # 统一关键词：所有模型使用同一批关键词（数量一致 + 英文原词）
         fixed_keywords = extract_keywords(english.strip(), k=k)
 
-        st.markdown("✅ 本次统一关键词：")
-        st.table([{"序号": i + 1, "关键词": w} for i, w in enumerate(fixed_keywords)])
+        st.markdown("关键词如下：")
+        st.dataframe(
+            [{"序号": i + 1, "关键词": w} for i, w in enumerate(fixed_keywords)],
+            use_container_width=True,
+            hide_index=True
+        )
 
-        main_prompt = build_prompt_fixed_keywords(english.strip(), fixed_keywords)
-
+        # 核心变化：每个模型独立生成自己的关键词释义 + 自己补全缺失
         for model_name in MODELS:
             start = time.time()
             try:
-                out = call_ollama(model_name, main_prompt)
-                parsed = try_parse_json(out)
+                # 1) 这个模型自己生成关键词释义
+                kw_map = get_keyword_meanings(model_name, fixed_keywords)
 
-                # 先准备对齐表格（固定 k 行）
-                aligned = [{"单词": w, "中文释义": ""} for w in fixed_keywords]
-                translation = ""
-
-                if parsed:
-                    # ✅ 尝试读 keywords
-                    model_kw = parsed.get("keywords", [])
-                    kw_map = {}
-                    if isinstance(model_kw, list):
-                        for item in model_kw:
-                            if isinstance(item, dict):
-                                w = str(item.get("word", "")).strip()
-                                z = str(item.get("meaning_zh", "")).strip()
-                                if w:
-                                    kw_map[w] = z
-
-                    for row in aligned:
-                        row["中文释义"] = kw_map.get(row["单词"], "")
-
-                    # ✅ 尝试读 translation
-                    translation = str(parsed.get("translation_zh", "")).strip()
-
-                # ✅✅✅ 关键：内容不完整时，自动补全
-                missing_words = [row["单词"] for row in aligned if not row["中文释义"].strip()]
+                # 2) 如果缺失，就让它自己补全缺失的词
+                missing_words = [w for w in fixed_keywords if not kw_map.get(w, "").strip()]
                 if missing_words:
                     fill_map = fill_missing_meanings(model_name, missing_words)
-                    for row in aligned:
-                        if not row["中文释义"].strip():
-                            row["中文释义"] = fill_map.get(row["单词"], "")
+                    for w in missing_words:
+                        if not kw_map.get(w, "").strip():
+                            kw_map[w] = fill_map.get(w, "")
 
-                if not translation.strip():
-                    translation = generate_translation_only(model_name, english.strip())
+                # 3) 对齐显示（确保行数一定是 k 行）
+                aligned = [{"keyword": w, "meaning_zh": kw_map.get(w, "")} for w in fixed_keywords]
+
+                # 4) 全文翻译也由该模型自己生成（保持差异）
+                translation = generate_translation_only(model_name, english.strip())
 
                 # 判定是否稳定（只要还有空释义，就提示不稳定）
-                has_empty = any(not row["中文释义"].strip() for row in aligned)
+                has_empty = any(not row["meaning_zh"].strip() for row in aligned)
                 results[model_name] = {
                     "ok": not has_empty,
                     "keywords": aligned,
@@ -275,7 +294,7 @@ if run_btn:
                 }
 
             except Exception as e:
-                aligned = [{"单词": w, "中文释义": ""} for w in fixed_keywords]
+                aligned = [{"keyword": w, "meaning_zh": ""} for w in fixed_keywords]
                 results[model_name] = {
                     "ok": False,
                     "keywords": aligned,
@@ -285,14 +304,14 @@ if run_btn:
 
             times[model_name] = time.time() - start
 
-        st.success("完成 ✅")
+        st.success("完成")
 
-        st.subheader("📌 四模型输出（关键词释义 + 整段翻译）")
+        st.subheader("输出展示（关键词释义 + 整段翻译）")
 
         cols = st.columns(2)
         for idx, model_name in enumerate(MODELS):
             with cols[idx % 2]:
-                st.markdown(f"## 🧠 {model_name}")
+                st.markdown(f"##  {model_name}")
                 st.caption(f"耗时：{times[model_name]:.2f} 秒")
 
                 # 提示稳定性
@@ -302,29 +321,27 @@ if run_btn:
                     else:
                         st.warning("该模型输出不稳定：部分释义仍为空（已尽力自动补全）")
 
-                # ✅ 关键词表格（序号从 1 开始）
-                st.markdown("### ✅ 关键词释义")
+                # 关键词表格：列名是「关键词」，显示英文
+                st.markdown("### 关键词释义")
                 table_data = [
-                    {"序号": i + 1, "单词": row["单词"], "中文释义": row["中文释义"]}
+                    {"序号": i + 1, "关键词": row["keyword"], "中文释义": row["meaning_zh"]}
                     for i, row in enumerate(results[model_name]["keywords"])
                 ]
-                st.table(table_data)
+                st.dataframe(table_data, use_container_width=True, hide_index=True)
 
                 # 翻译
-                st.markdown("### ✅ 整段中文翻译")
+                st.markdown("### 全文翻译")
                 st.write(results[model_name]["translation_zh"] if results[model_name]["translation_zh"] else "(空)")
 
                 st.divider()
 
-        # 汇总表预览
-        st.subheader("🧾 汇总表（预览）")
-        PREVIEW_LEN = 120
-        st.table([
-            {
-                "model": model_name,
-                "time(s)": f"{times[model_name]:.2f}",
-                "translation_preview": (results[model_name]["translation_zh"][:PREVIEW_LEN] + " …")
-                if len(results[model_name]["translation_zh"]) > PREVIEW_LEN else results[model_name]["translation_zh"],
-            }
-            for model_name in MODELS
-        ])
+        # 汇总表：四模型整句翻译
+        st.subheader("结果汇总")
+        st.dataframe(
+            [
+                {"模型": model_name, "整句翻译": results[model_name]["translation_zh"] or "(空)"}
+                for model_name in MODELS
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
