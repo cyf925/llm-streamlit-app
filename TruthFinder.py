@@ -1,86 +1,18 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set, Iterable, Optional
+from typing import Dict, List, Tuple, Set
 import math
-import re
+from normalize import normalize_meaning_zh_soft
 
-# 1) Soft normalize: raw -> List[candidate fact]
-ZH_ALIAS_SOFT = {
-    "站点": "网站",
-    "网页": "网站",
-    "網站": "网站",
-}
+# 1) Similarity / implication utilities
 
-_SPLIT_RE = re.compile(r"[，,;；/｜|、\n]+|(?:\s+)|(?:或者)|(?:或是)|(?:\b或\b)")
-_PARENS_RE = re.compile(r"[\(\（].*?[\)\）]")
-_PREFIX_PATTERNS = [
-    r"^指的是[:：]?", r"^指为[:：]?", r"^表示[:：]?", r"^意为[:：]?",
-    r"^意思是[:：]?", r"^一种[:：]?", r"^用于[:：]?", r"^用来[:：]?",
-    r"^用於[:：]?", r"^即[:：]?", r"^也称[:：]?", r"^又称[:：]?", r"^亦称[:：]?"
-]
-_PREFIX_RE = re.compile("|".join(_PREFIX_PATTERNS))
-_KEEP_CORE_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]+")
-
-
-def _clean_piece(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    s = _PARENS_RE.sub("", s).strip()
-    s = _PREFIX_RE.sub("", s).strip()
-    s = s.strip(" \"'“”‘’。.!！?？:：")
-    if not s:
-        return ""
-    s = _KEEP_CORE_RE.sub("", s).strip()
-    s = ZH_ALIAS_SOFT.get(s, s)
-    return s
-
-
-def normalize_meaning_zh_soft(raw: str, top_n: int = 3) -> List[str]:
-    """
-    软归一化：返回 1~top_n 个候选（fact candidates），尽量保留差异。
-    """
-    if not raw or not str(raw).strip():
-        return []
-    raw2 = _PARENS_RE.sub("", str(raw).strip())
-    parts = [p.strip() for p in _SPLIT_RE.split(raw2) if p and p.strip()]
-    if not parts:
-        parts = [raw2]
-
-    cleaned: List[str] = []
-    seen: Set[str] = set()
-    for p in parts:
-        c = _clean_piece(p)
-        if c and c not in seen:
-            seen.add(c)
-            cleaned.append(c)
-
-    if not cleaned:
-        return []
-
-    # 排序：优先“包含汉字”的候选，其次更短更像词条（避免长句）
-    cleaned.sort(
-        key=lambda x: (1 if re.search(r"[\u4e00-\u9fff]", x) else 0, -len(x)),
-        reverse=True
-    )
-    return cleaned[:top_n]
-
-
-def display_norm_candidates(cands: List[str]) -> str:
-    if not cands:
-        return "(空)"
-    return "｜".join(cands)
-
-# 2) Similarity + implication (for facts under same object)
 def _char_ngrams(s: str, n: int = 2) -> Set[str]:
     s = (s or "").strip()
     if not s:
         return set()
-    # 对中文，2-gram 的区分度一般够用
     if len(s) < n:
         return {s}
     return {s[i:i+n] for i in range(len(s) - n + 1)}
-
 
 def jaccard(a: Set[str], b: Set[str]) -> float:
     if not a and not b:
@@ -91,38 +23,37 @@ def jaccard(a: Set[str], b: Set[str]) -> float:
     union = len(a | b)
     return inter / union if union else 0.0
 
-
 def fact_similarity(f1: str, f2: str) -> float:
     if f1 == f2:
         return 1.0
     return jaccard(_char_ngrams(f1, 2), _char_ngrams(f2, 2))
 
-
-def build_implication_matrix(facts: List[str]) -> Dict[Tuple[str, str], float]:
+def build_implication_matrix(
+    facts: List[str],
+    sim_threshold: float = 0.45
+) -> Dict[Tuple[str, str], float]:
     """
-    返回 imp[(f_i, f_j)] ∈ [0,1]：
-    - 越相近，imp 越大（正向支持）
-    - 这里不显式建负向 imp；冲突用 (1-sim) 在更新时做惩罚
+    imp[(g,f)] ∈ [0,1]：g 对 f 的正向支持强度（由相似度近似）。
+    - threshold 提高（默认 0.45）：减少“不同含义但字面相似”造成的误传播
     """
     imp: Dict[Tuple[str, str], float] = {}
     for i in range(len(facts)):
         for j in range(len(facts)):
             if i == j:
                 continue
-            sim = fact_similarity(facts[i], facts[j])
-            # 相似度太低就当作没有支持关系，避免引入噪声
-            if sim >= 0.35:
-                imp[(facts[i], facts[j])] = sim
+            g, f = facts[i], facts[j]
+            sim = fact_similarity(g, f)
+            if sim >= sim_threshold:
+                imp[(g, f)] = sim
     return imp
 
-
-# 3) TruthFinder core with rho(dependency) + gamma(dampening)
+# 2) Core math utilities
 def _tau(t: float) -> float:
     t = min(max(t, 1e-6), 1 - 1e-6)
     return -math.log(1 - t)
 
 def _sigmoid(x: float) -> float:
-    # 避免溢出
+    # avoid overflow
     if x >= 60:
         return 1.0
     if x <= -60:
@@ -130,59 +61,100 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 def _cosine(a: List[float], b: List[float]) -> float:
-    dot = sum(x*y for x, y in zip(a, b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(y*y for y in b))
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
 
 
-def compute_rho_dependency(
+# 3) rho dependency (model correlation)
+
+def compute_rho_dependency_top1(
     models: List[str],
-    obj_fact_support: Dict[Tuple[str, str], Set[str]],
+    top1_choice: Dict[str, Dict[Tuple[str, str], str]],
 ) -> Dict[Tuple[str, str], float]:
     """
-    估计模型间“相互依赖程度” rho(w1,w2) ∈ [0,1]。
-    我的场景：若两个模型经常给出相同/相近的 fact（在同一批 object 上），
-    则它们的投票不能当作独立证据。
-
-    简化做法：把每个模型提供的 (object,fact) 当作集合，算 Jaccard。
+    依赖度 rho(w1,w2) ∈ [0,1]
+    这里用“每个 object 的 top1 fact”来计算 Jaccard：
+    - 避免 soft-normalize 多候选导致 rho 虚高
+    top1_choice[model][obj] = top1_fact
     """
-    model_sets: Dict[str, Set[Tuple[str, str]]] = {m: set() for m in models}
-    for (obj, fact), ws in obj_fact_support.items():
-        for w in ws:
-            model_sets[w].add((obj, fact))
+    model_sets: Dict[str, Set[Tuple[Tuple[str, str], str]]] = {m: set() for m in models}
+
+    for m in models:
+        for obj, f in (top1_choice.get(m, {}) or {}).items():
+            model_sets[m].add((obj, f))
 
     rho: Dict[Tuple[str, str], float] = {}
     for i in range(len(models)):
         for j in range(len(models)):
             if i == j:
                 continue
-            a = model_sets[models[i]]
-            b = model_sets[models[j]]
-            rho[(models[i], models[j])] = jaccard(a, b)
+            w1, w2 = models[i], models[j]
+            rho[(w1, w2)] = jaccard(model_sets[w1], model_sets[w2])
     return rho
 
 
+# 4) Config
 @dataclass
 class TruthFinderConfig:
     # 初始模型可信度
     t0: float = 0.75
-    # 用于把 Σtau 映射到 s 的强度
+
+    # Σ(evidence) -> s 的映射强度
     beta: float = 0.35
-    # 依赖衰减因子 gamma：越大越“保守”，越不相信相关模型的重复投票
-    gamma: float = 0.35
-    # implication 强度（对同一 object 下相近事实的“互相加分”）
-    alpha_imp: float = 0.25
-    # 冲突惩罚强度（对同一 object 下互斥/很不相似事实的“互相扣分”）
-    alpha_conflict: float = 0.15
+
+    # 依赖衰减强度（越大越不相信“相关模型的重复投票”）
+    gamma: float = 0.30
+
+    # implication 强度（相似事实互相支持）
+    alpha_imp: float = 0.20
+
+    # conflict 强度（强冲突惩罚）
+    alpha_conflict: float = 0.10
+
     # 每个释义保留候选数量
     topn_candidates: int = 3
+
+    # implication 相似阈值（越高越保守）
+    imp_sim_threshold: float = 0.45
+
+    # conflict 相似阈值（越低越保守）
+    conflict_sim_threshold: float = 0.10
+
     # 迭代停止阈值：1 - cosine(old_t, new_t) < delta
     delta: float = 1e-4
     max_iter: int = 25
 
+    # 多候选加权的衰减系数（越小越偏向 top1）
+    # weight_i ∝ cand_decay^i, i=0..n-1
+    cand_decay: float = 0.30
+
+    # tau 最小衰减比例（避免被依赖惩罚到接近 0）
+    min_tau_scale: float = 0.20
+
+
+# 5) Helpers: candidate weighting
+
+def _candidate_weights(n: int, decay: float) -> List[float]:
+    """
+    生成 n 个候选的权重，保证 sum=1。
+    - n=1 -> [1]
+    - n>1 -> w_i ∝ decay^i（i=0最强），再归一化
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        return [1.0]
+    decay = min(max(decay, 1e-6), 1.0)
+    ws = [decay ** i for i in range(n)]
+    s = sum(ws)
+    return [w / s for w in ws] if s > 0 else [1.0 / n] * n
+
+
+# 6) TruthFinder main
 
 def truthfinder_run(
     models: List[str],
@@ -190,7 +162,11 @@ def truthfinder_run(
     keywords: List[str],
     results: Dict[str, dict],
     cfg: TruthFinderConfig = TruthFinderConfig()
-) -> Tuple[Dict[str, float], Dict[Tuple[str, str], Dict[str, float]], Dict[Tuple[str, str], List[str]]]:
+) -> Tuple[
+    Dict[str, float],                               # t_score[model]
+    Dict[Tuple[str, str], Dict[str, float]],        # s_score[obj][fact]
+    Dict[Tuple[str, str], List[str]]                # cand_map[obj] -> facts
+]:
     """
     返回：
     1) t_score[model] = 模型可信度
@@ -198,21 +174,24 @@ def truthfinder_run(
     3) cand_map[(sentence_id,kw)] = 该 object 的候选 fact 列表（用于展示/调试）
     """
 
-    # ----- 1) 构造 object / fact / providers -----
-    # object: (sentence_id, keyword)
+    # ----- 1) objects -----
     objects: List[Tuple[str, str]] = [(sentence_id, kw) for kw in keywords]
 
-    # obj_facts[o] = list of candidate facts for that object (dedup)
+    # 候选表
     obj_facts: Dict[Tuple[str, str], List[str]] = {o: [] for o in objects}
-    # providers[(obj,fact)] = set(models)
-    obj_fact_support: Dict[Tuple[str, str], Set[str]] = {}
 
-    # results[model]["keywords"] = [{"keyword":..., "meaning_zh":...}, ...]
+    # “加权支持”：support[(obj,fact)][model] = weight
+    support: Dict[Tuple[Tuple[str, str], str], Dict[str, float]] = {}
+
+    # 为 rho 计算准备：top1_choice[model][obj] = top1_fact
+    top1_choice: Dict[str, Dict[Tuple[str, str], str]] = {m: {} for m in models}
+
+    # ----- 2) build candidates + weighted support -----
     for m in models:
         payload = results.get(m, {}) or {}
         rows = payload.get("keywords", []) or []
-        # 建一个 kw->meaning 的映射，容错
-        kw2raw = {}
+
+        kw2raw: Dict[str, str] = {}
         for r in rows:
             k = (r.get("keyword") or "").strip()
             v = (r.get("meaning_zh") or "").strip()
@@ -222,110 +201,138 @@ def truthfinder_run(
         for kw in keywords:
             o = (sentence_id, kw)
             raw = kw2raw.get(kw, "")
-            cands = normalize_meaning_zh_soft(raw, top_n=cfg.topn_candidates)
-            # 一个模型对一个关键词可能给出多个候选（例如 “执行｜进行｜实施”）
-            # 我们认为它“支持”这些候选（弱支持）
-            for fact in cands:
-                obj_fact_support.setdefault((o, fact), set()).add(m)
 
-            # 维护 object 的候选全集（去重）
+            cands = normalize_meaning_zh_soft(raw, top_n=cfg.topn_candidates)
+            cands = [c.strip() for c in (cands or []) if c and str(c).strip()]
+
+            # 如果完全空，先跳过；后面统一补 "(空)"
+            if not cands:
+                continue
+
+            # 记录 top1（用于 rho）
+            top1_choice[m][o] = cands[0]
+
+            # 对多个候选分配权重（总和=1）
+            ws = _candidate_weights(len(cands), decay=cfg.cand_decay)
+
+            for fact, wgt in zip(cands, ws):
+                key = (o, fact)
+                support.setdefault(key, {})
+                support[key][m] = support[key].get(m, 0.0) + float(wgt)
+
+            # 维护 obj 的候选全集（去重）
             for fact in cands:
                 if fact not in obj_facts[o]:
                     obj_facts[o].append(fact)
 
-    # 若某些 object 一个候选都没有（模型都空），补一个占位，避免后续空集合
+    # 若某些 object 一个候选都没有（模型都空），补 "(空)"，并让所有模型弱支持它（平均分）
     for o in objects:
         if not obj_facts[o]:
             obj_facts[o] = ["(空)"]
-            obj_fact_support.setdefault((o, "(空)"), set()).update(set(models))
+            key = (o, "(空)")
+            support.setdefault(key, {})
+            for m in models:
+                support[key][m] = 1.0 / max(1, len(models))
+                top1_choice[m][o] = "(空)"
 
-    # ----- 2) 计算 rho 依赖矩阵（模型间相似度/依赖） -----
-    rho = compute_rho_dependency(models, obj_fact_support)
+    # ----- 3) rho dependency -----
+    rho = compute_rho_dependency_top1(models, top1_choice)
 
-    # 给每个模型一个“平均依赖度”（与其他模型的平均 rho），用于衰减它的贡献
+    # 仍保留“平均依赖度”的做法，但 rho 已不再因多候选虚高
     dep_avg: Dict[str, float] = {}
     for w in models:
         vals = [rho.get((w, u), 0.0) for u in models if u != w]
         dep_avg[w] = sum(vals) / len(vals) if vals else 0.0
 
-    # ----- 3) 初始化 t(w) -----
+    # ----- 4) init t -----
     t: Dict[str, float] = {w: cfg.t0 for w in models}
 
-    # F(w)：模型 w 提供了哪些 (o,fact)（用于更新 t）
-    Fw: Dict[str, List[Tuple[Tuple[str, str], str]]] = {w: [] for w in models}
-    for (o, fact), ws in obj_fact_support.items():
-        for w in ws:
-            Fw[w].append((o, fact))
+    # F(w)：用于更新 t 的“加权样本”
+    # entries[w] = list of (obj, fact, weight)
+    entries: Dict[str, List[Tuple[Tuple[str, str], str, float]]] = {w: [] for w in models}
+    for (o, fact), m2w in support.items():
+        for w, wgt in m2w.items():
+            if wgt > 0:
+                entries[w].append((o, fact, float(wgt)))
 
-    # s_score[o][fact] = confidence
+    # s_score[obj][fact]
     s_score: Dict[Tuple[str, str], Dict[str, float]] = {o: {} for o in objects}
+    last_s: Dict[Tuple[str, str], Dict[str, float]] = {o: {} for o in objects}
 
-    # ----- 4) 迭代更新：先算 s，再算 t -----
+    # ----- 5) iterate -----
     for _ in range(cfg.max_iter):
         old_vec = [t[w] for w in models]
 
-        tau = {}
+        # 5.1 tau with dependency dampening (global, but rho computed on top1)
+        tau: Dict[str, float] = {}
         for w in models:
             base = _tau(t[w])
-            # 依赖衰减：越依赖越扣（gamma）
-            # dep_avg=0 -> 不扣；dep_avg=1 -> 最多扣 gamma
-            tau[w] = base * max(0.05, (1.0 - cfg.gamma * dep_avg[w]))
+            scale = 1.0 - cfg.gamma * dep_avg.get(w, 0.0)
+            scale = max(cfg.min_tau_scale, scale)
+            tau[w] = base * scale
 
-        # 4.1 更新每个 object 下每个 fact 的置信度
+        # 5.2 update s for each object
         for o in objects:
             facts = obj_facts[o]
-            imp = build_implication_matrix(facts)
+            imp = build_implication_matrix(facts, sim_threshold=cfg.imp_sim_threshold)
 
-            # 先算“证据项”：来自支持该 fact 的模型贡献
+            # evidence from weighted votes
             base_sigma: Dict[str, float] = {}
             for f in facts:
-                ws = obj_fact_support.get((o, f), set())
-                base_sigma[f] = sum(tau[w] for w in ws)
+                m2w = support.get((o, f), {}) or {}
+                base_sigma[f] = sum(tau[m] * wgt for m, wgt in m2w.items())
 
-            # 再加上 implication / conflict 的影响（同一 object 内部）
+            # implication/conflict use last_s (avoid same-iteration self-amplification)
             for f in facts:
-                # 正向：相似事实互相加分
                 imp_bonus = 0.0
-                # 负向：很不相似/冲突的事实互相扣分
                 conf_pen = 0.0
 
                 for g in facts:
                     if g == f:
                         continue
                     sim = fact_similarity(f, g)
-                    # g 的“强度”用它当前的证据项近似（避免需要上轮 s）
-                    g_strength = base_sigma.get(g, 0.0)
 
-                    if sim >= 0.35:
+                    g_strength = float(last_s.get(o, {}).get(g, 0.0))
+
+                    # 正向 implication：只在较高相似时传播
+                    if sim >= cfg.imp_sim_threshold:
                         imp_bonus += imp.get((g, f), 0.0) * g_strength
-                    elif sim <= 0.15:
+
+                    # 冲突惩罚：只在“非常不相似”时触发（更保守）
+                    elif sim <= cfg.conflict_sim_threshold:
                         conf_pen += (1.0 - sim) * g_strength
 
                 score = base_sigma[f] + cfg.alpha_imp * imp_bonus - cfg.alpha_conflict * conf_pen
-                # 映射到 [0,1]
                 s_score[o][f] = _sigmoid(cfg.beta * score)
 
-        # 4.2 更新 t(w)：取其提供的 (o,fact) 的平均 s
+        # 把本轮 s 复制到 last_s（用于下一轮的 implication）
+        for o in objects:
+            last_s[o] = dict(s_score.get(o, {}))
+
+        # 5.3 update t(w): weighted average of s(o,f) over what w supported
         new_t: Dict[str, float] = {}
         for w in models:
-            pairs = Fw.get(w, [])
-            if not pairs:
+            es = entries.get(w, [])
+            if not es:
                 new_t[w] = t[w]
                 continue
-            vals = []
-            for (o, f) in pairs:
-                vals.append(s_score.get(o, {}).get(f, 0.0))
-            new_t[w] = sum(vals) / len(vals) if vals else t[w]
+            num = 0.0
+            den = 0.0
+            for (o, f, wgt) in es:
+                num += float(wgt) * float(s_score.get(o, {}).get(f, 0.0))
+                den += float(wgt)
+            new_t[w] = (num / den) if den > 0 else t[w]
 
         t = new_t
         new_vec = [t[w] for w in models]
         if 1.0 - _cosine(old_vec, new_vec) < cfg.delta:
             break
 
-    # 输出候选表（用于 app 展示/调试）
     cand_map = {o: obj_facts[o] for o in objects}
     return t, s_score, cand_map
 
+
+# 7) Picking truth per keyword (same interface)
 
 def pick_truth_per_keyword(
     sentence_id: str,
@@ -335,8 +342,8 @@ def pick_truth_per_keyword(
     margin: float = 0.03
 ) -> List[dict]:
     """
-    对每个 keyword（object）选出 top 事实。
-    若 top1 与 top2 差距很小（<= margin），返回两个，避免“硬选唯一真值”。
+    对每个 keyword(object) 选出 top 事实。
+    若 top1 与 top2 差距很小（<= margin），返回多个，避免“硬选唯一真值”。
     """
     out = []
     for kw in keywords:
@@ -345,14 +352,15 @@ def pick_truth_per_keyword(
         if not facts_conf:
             out.append({"keyword": kw, "truth": ["(空)"], "conf": [0.0]})
             continue
+
         facts_conf.sort(key=lambda x: x[1], reverse=True)
 
         if len(facts_conf) == 1:
-            out.append({"keyword": kw, "truth": [facts_conf[0][0]], "conf": [facts_conf[0][1]]})
+            out.append({"keyword": kw, "truth": [facts_conf[0][0]], "conf": [float(facts_conf[0][1])]})
             continue
 
         (f1, c1), (f2, c2) = facts_conf[0], facts_conf[1]
-        if c1 - c2 <= margin:
+        if float(c1) - float(c2) <= margin:
             picked = facts_conf[:max(2, top_k)]
         else:
             picked = facts_conf[:1]
@@ -360,7 +368,7 @@ def pick_truth_per_keyword(
         out.append({
             "keyword": kw,
             "truth": [f for f, _ in picked],
-            "conf": [float(c) for _, c in picked]
+            "conf": [float(c) for _, c in picked],
         })
     return out
 
