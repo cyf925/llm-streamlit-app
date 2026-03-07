@@ -3,6 +3,8 @@ import requests
 import time
 import json
 import re
+from normalize import normalize_meaning_zh_soft,format_candidates
+
 
 # ===== ollama部署的4个模型 =====
 MODELS = [
@@ -38,9 +40,9 @@ STOPWORDS = set("""
 a an the in on at for to can both all of and or but so with without among 
 between into from by as is are was were be been being
 this that these those it its we you they i he she them our your their my myself 
-your yourself his her its myself oneself have has had having been has been only 
+your yourself his her myself oneself have has had having been has been only 
 how what when where why who which about above after against along 
-among around at before behind below beside between beyond
+among around at before behind below beside between beyond do does did doing done not 
 """.split())
 
 def extract_keywords(english_text: str, k: int = 6):
@@ -204,70 +206,9 @@ def generate_translation_only(model: str, english_text: str, timeout: int = 180)
     out = call_ollama(model, prompt, timeout=timeout)
     return (out or "").strip()
 
-# ===== 归一化关键词释义处理（soft：保留候选列表，1~3个） =====
-from typing import List
-
-ZH_ALIAS_SOFT = {
-    "站点": "网站",
-    "网页": "网站",
-    "網站": "网站",
-}
-_SPLIT_RE = re.compile(r"[，,;；/｜|、\n]+|(?:\s+)|(?:或者)|(?:或是)|(?:\b或\b)")
-_PARENS_RE = re.compile(r"[\(\（].*?[\)\）]")
-_PREFIX_PATTERNS = [
-    r"^指的是[:：]?", r"^指为[:：]?", r"^表示[:：]?", r"^意为[:：]?",
-    r"^意思是[:：]?", r"^一种[:：]?", r"^用于[:：]?", r"^用来[:：]?",
-    r"^用於[:：]?", r"^即[:：]?", r"^也称[:：]?", r"^又称[:：]?", r"^亦称[:：]?"
-]
-_PREFIX_RE = re.compile("|".join(_PREFIX_PATTERNS))
-_KEEP_CORE_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]+")
-
-def _clean_piece(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    s = _PARENS_RE.sub("", s).strip()
-    s = _PREFIX_RE.sub("", s).strip()
-    s = s.strip(" \"'“”‘’。.!！?？:：")
-    if not s:
-        return ""
-    s = _KEEP_CORE_RE.sub("", s).strip()
-    s = ZH_ALIAS_SOFT.get(s, s)
-    return s
-
-def normalize_meaning_zh_soft(raw: str, top_n: int = 3) -> List[str]:
-    """
-    软归一化：返回候选中文释义列表，保留差异，不强行合并多义。
-    """
-    if not raw or not str(raw).strip():
-        return []
-    raw2 = _PARENS_RE.sub("", str(raw).strip())
-    parts = [p.strip() for p in _SPLIT_RE.split(raw2) if p and p.strip()]
-    if not parts:
-        parts = [raw2]
-    cleaned = []
-    seen = set()
-    for p in parts:
-        c = _clean_piece(p)
-        if c and c not in seen:
-            seen.add(c)
-            cleaned.append(c)
-    if not cleaned:
-        return []
-    # 排序：优先包含汉字的，次优先长度较短的（更像词条）
-    cleaned.sort(key=lambda x: (1 if re.search(r"[\u4e00-\u9fff]", x) else 0, -len(x)), reverse=True)
-    return cleaned[:top_n]
-
-def display_norm_candidates(cands: List[str]) -> str:
-    """前端展示：将候选列表拼接成一个字符串"""
-    if not cands:
-        return "(空)"
-    return "｜".join(cands)
-
 # ===== Streamlit 页面 =====
 st.set_page_config(page_title="LLM Translator Comparator", layout="wide")
 st.title("LLM Translator Comparator")
-st.caption("输入英文文本，系统调用 4 个本地模型分别生成该文本的中文翻译")
 
 # 初始化会话状态用于存储结果
 if 'results' not in st.session_state:
@@ -411,7 +352,7 @@ if english.strip():
                 for model_name in MODELS:
                     meaning = results[model_name]["keywords"][i]["meaning_zh"]
                     cands = normalize_meaning_zh_soft(meaning, top_n=3)
-                    row[model_name] = display_norm_candidates(cands)
+                    row[model_name] = format_candidates(cands, sep="｜")
                 normalized_rows.append(row)
 
             with st.expander("归一化关键词释义对比表格", expanded=True):
@@ -487,6 +428,6 @@ if english.strip():
                         )
 
                         best_model = rank[0][0] if rank else MODELS[0]
-                        st.subheader("TruthFinder：推荐翻译结果（按模型可信度最高）")
-                        st.markdown(f"**推荐模型：{best_model}**")
+                        st.subheader("TruthFinder：推荐翻译结果（按可信度最高）")
+                        st.markdown(f"**MODEL：{best_model}**")
                         st.write(results.get(best_model, {}).get("translation_zh", "") or "(空)")
