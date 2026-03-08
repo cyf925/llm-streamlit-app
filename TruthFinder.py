@@ -200,6 +200,8 @@ def truthfinder_run(
     obj_facts: Dict[Tuple[str, str], List[str]] = {o: [] for o in objects}
 
     # “加权支持”：support[(obj,fact)][model] = weight
+    # 当前 support 模式：soft_candidates（同一模型对同一关键词可支持多个候选 fact）
+    # 多候选权重由 cand_decay 生成并归一化，单个关键词下权重总和=1
     support: Dict[Tuple[Tuple[str, str], str], Dict[str, float]] = {}
 
     # 为 rho 计算准备：top1_choice[model][obj] = top1_fact
@@ -252,7 +254,7 @@ def truthfinder_run(
             key = (o, "(空)")
             support.setdefault(key, {})
             for m in models:
-                support[key][m] = 1.0 / max(1, len(models))
+                support[key][m] = 1.0
                 top1_choice[m][o] = "(空)"
 
     # ----- 3) rho dependency -----
