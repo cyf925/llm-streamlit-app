@@ -1,0 +1,167 @@
+{
+  "version": "tfzk-runtime-v2-draft",
+
+  "shape": {
+    "M": 4,
+    "K_MAX": 15,
+    "N_MAX": 12,
+    "ITER_N": 25,
+    "note": "M<=4, K<=15, each object has N<=12 candidate facts."
+  },
+
+  "fixed_point": {
+    "format": "Q16",
+    "scale_pow2": 16,
+    "scale": "65536",
+    "rounding_note": "Q16 integers are stored as strings; generator should apply consistent rounding policy."
+  },
+
+  "runtime": {
+    "session_id": "SESSION_ID_PLACEHOLDER",
+    "sentence_id": "s0",
+    "input_text": "USER_INPUT_SENTENCE_PLACEHOLDER",
+    "K": 0,
+    "model_ids": [
+      "qwen2.5:7b-instruct-q4_K_M",
+      "mistral:7b-instruct-v0.3-q5_0",
+      "gemma2:9b-instruct-q4_K_M",
+      "koesn/mistral-7b-instruct:Q4_0"
+    ],
+    "support_mode": "soft_candidates",
+    "padding_rule": "Only objects o < K are effective; objects o >= K are padded-zero objects."
+  },
+
+  "objects": [
+    {
+      "o": 0,
+      "keyword": "KEYWORD_0_PLACEHOLDER",
+      "is_effective": true
+    }
+  ],
+
+  "facts": {
+    "0": [
+      "FACT_0_0_PLACEHOLDER",
+      "FACT_0_1_PLACEHOLDER"
+    ]
+  },
+
+  "facts_meta": {
+    "note": "facts[o] are normalized candidate facts generated outside circuit from normalize.py output.",
+    "max_candidates_per_object": 12
+  },
+
+  "top1_choice": {
+    "qwen2.5:7b-instruct-q4_K_M": {
+      "0": 0
+    },
+    "mistral:7b-instruct-v0.3-q5_0": {
+      "0": 1
+    },
+    "gemma2:9b-instruct-q4_K_M": {
+      "0": 0
+    },
+    "koesn/mistral-7b-instruct:Q4_0": {
+      "0": 0
+    }
+  },
+
+  "params_q16": {
+    "t0": "49152",
+    "beta": "22938",
+    "gamma": "19661",
+    "alpha_imp": "13107",
+    "alpha_conflict": "6554",
+    "cand_decay": "19661",
+    "min_tau_scale": "13107"
+  },
+
+  "params_meta": {
+    "topn_candidates": 3,
+    "imp_sim_threshold": 0.45,
+    "conflict_sim_threshold": 0.15,
+    "delta": 0.0001,
+    "max_iter": 25,
+    "support_mode": "soft_candidates",
+    "note": "max_iter fixed to 25 for Python/circuit alignment; delta retained as metadata only."
+  },
+
+  "defaults_q16": {
+    "dep_avg": [ "0", "0", "0", "0" ],
+    "support_default": "0",
+    "imp_weight_default": "0",
+    "conf_weight_default": "0",
+    "top1_default": "-1"
+  },
+
+  "patches": {
+    "dep_avg_patch": [
+      {
+        "w": 0,
+        "value": "0"
+      }
+    ],
+
+    "support_patch": [
+      {
+        "o": 0,
+        "f": 0,
+        "w": 0,
+        "value": "65536"
+      }
+    ],
+
+    "imp_weight_patch": [
+      {
+        "o": 0,
+        "g": 0,
+        "f": 1,
+        "value": "32768"
+      }
+    ],
+
+    "conf_weight_patch": [
+      {
+        "o": 0,
+        "g": 0,
+        "f": 1,
+        "value": "58982"
+      }
+    ]
+  },
+
+  "patch_semantics": {
+    "support": "support[o][f][w] in Q16. For soft_candidates, per (o,w), sum_f support == 65536 when object effective and model has candidates; fallback '(Пе)' also represented as single-fact support=65536.",
+    "imp_conf": "imp/conf are explicit matrices generated outside circuit from normalized facts and similarity thresholds."
+  },
+
+  "provenance": {
+    "truthfinder_version": "TruthFinder.py-current",
+    "normalize_version": "normalize.py-current",
+    "app_version": "app.py-current",
+    "generator_version": "build_truthfinder_runtime_input_from_state-v1",
+    "facts_hash": "TO_BE_FILLED",
+    "imp_hash": "TO_BE_FILLED",
+    "conf_hash": "TO_BE_FILLED",
+    "support_hash": "TO_BE_FILLED",
+    "top1_hash": "TO_BE_FILLED",
+    "normalize_hash": "TO_BE_FILLED",
+    "input_hash": "TO_BE_FILLED",
+    "note": "normalize / facts / imp / conf are generated outside circuit and locked by provenance/hash."
+  },
+
+  "constraints": {
+    "model_count_max": 4,
+    "keyword_count_max": 15,
+    "fact_count_max_per_object": 12,
+    "iter_fixed": 25,
+    "q16_range": [ "0", "65536" ],
+    "no_negative_weights": true,
+    "support_row_sum_q16": "65536",
+    "imp_conf_range_q16": [ "0", "65536" ],
+    "dep_avg_range_q16": [ "0", "65536" ],
+    "conf_must_be_symmetric": true,
+    "imp_may_be_asymmetric": true,
+    "top1_index_range": "[-1, N_o-1], -1 for padded/unknown"
+  }
+}
