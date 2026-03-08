@@ -47,6 +47,25 @@ def build_implication_matrix(
                 imp[(g, f)] = sim
     return imp
 
+def build_conflict_matrix(
+    facts: List[str],
+    sim_threshold: float = 0.15
+) -> Dict[Tuple[str, str], float]:
+    """
+    conf[(g,f)] ∈ [0,1]：g 对 f 的冲突强度（由低相似度近似）。
+    - 仅在 sim <= threshold 时记录 1-sim
+    """
+    conf: Dict[Tuple[str, str], float] = {}
+    for i in range(len(facts)):
+        for j in range(i + 1, len(facts)):
+            fi, fj = facts[i], facts[j]
+            sim = fact_similarity(fi, fj)
+            if sim <= sim_threshold:
+                strength = 1.0 - sim
+                conf[(fi, fj)] = strength
+                conf[(fj, fi)] = strength
+    return conf
+
 # 2) Core math utilities
 def _tau(t: float) -> float:
     t = min(max(t, 1e-6), 1 - 1e-6)
@@ -122,9 +141,9 @@ class TruthFinderConfig:
     imp_sim_threshold: float = 0.45
 
     # conflict 相似阈值（越低越保守）
-    conflict_sim_threshold: float = 0.10
+    conflict_sim_threshold: float = 0.15
 
-    # 迭代停止阈值：1 - cosine(old_t, new_t) < delta
+    # 兼容字段：固定轮数迭代时不再用于提前停止
     delta: float = 1e-4
     max_iter: int = 25
 
@@ -202,6 +221,7 @@ def truthfinder_run(
             o = (sentence_id, kw)
             raw = kw2raw.get(kw, "")
 
+            # 归一化仍由 normalize.py 外部函数提供，这里仅调用结果
             cands = normalize_meaning_zh_soft(raw, top_n=cfg.topn_candidates)
             cands = [c.strip() for c in (cands or []) if c and str(c).strip()]
 
@@ -259,9 +279,17 @@ def truthfinder_run(
     s_score: Dict[Tuple[str, str], Dict[str, float]] = {o: {} for o in objects}
     last_s: Dict[Tuple[str, str], Dict[str, float]] = {o: {} for o in objects}
 
+    # 预构造显式矩阵：implication / conflict 都在迭代前固定
+    imp_mats: Dict[Tuple[str, str], Dict[Tuple[str, str], float]] = {}
+    conf_mats: Dict[Tuple[str, str], Dict[Tuple[str, str], float]] = {}
+    for o in objects:
+        facts = obj_facts[o]
+        imp_mats[o] = build_implication_matrix(facts, sim_threshold=cfg.imp_sim_threshold)
+        conf_mats[o] = build_conflict_matrix(facts, sim_threshold=cfg.conflict_sim_threshold)
+
     # ----- 5) iterate -----
+    # 固定轮数迭代（默认 25 轮），不再提前停止
     for _ in range(cfg.max_iter):
-        old_vec = [t[w] for w in models]
 
         # 5.1 tau with dependency dampening (global, but rho computed on top1)
         tau: Dict[str, float] = {}
@@ -274,7 +302,8 @@ def truthfinder_run(
         # 5.2 update s for each object
         for o in objects:
             facts = obj_facts[o]
-            imp = build_implication_matrix(facts, sim_threshold=cfg.imp_sim_threshold)
+            imp = imp_mats.get(o, {})
+            conf = conf_mats.get(o, {})
 
             # evidence from weighted votes
             base_sigma: Dict[str, float] = {}
@@ -290,17 +319,11 @@ def truthfinder_run(
                 for g in facts:
                     if g == f:
                         continue
-                    sim = fact_similarity(f, g)
 
                     g_strength = float(last_s.get(o, {}).get(g, 0.0))
-
-                    # 正向 implication：只在较高相似时传播
-                    if sim >= cfg.imp_sim_threshold:
-                        imp_bonus += imp.get((g, f), 0.0) * g_strength
-
-                    # 冲突惩罚：只在“非常不相似”时触发（更保守）
-                    elif sim <= cfg.conflict_sim_threshold:
-                        conf_pen += (1.0 - sim) * g_strength
+                    # implication / conflict 都直接从显式矩阵读取
+                    imp_bonus += imp.get((g, f), 0.0) * g_strength
+                    conf_pen += conf.get((g, f), 0.0) * g_strength
 
                 score = base_sigma[f] + cfg.alpha_imp * imp_bonus - cfg.alpha_conflict * conf_pen
                 s_score[o][f] = _sigmoid(cfg.beta * score)
@@ -324,9 +347,6 @@ def truthfinder_run(
             new_t[w] = (num / den) if den > 0 else t[w]
 
         t = new_t
-        new_vec = [t[w] for w in models]
-        if 1.0 - _cosine(old_vec, new_vec) < cfg.delta:
-            break
 
     cand_map = {o: obj_facts[o] for o in objects}
     return t, s_score, cand_map
