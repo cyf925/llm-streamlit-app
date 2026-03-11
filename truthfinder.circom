@@ -2,39 +2,6 @@ pragma circom 2.2.3;
 
 include "circomlib/circuits/comparators.circom";
 
-// -----------------------------------------------------------------------------
-// truthfinder.circom (Circom 2) - TruthFinder Circuit Spec v1 (project circuit semantics)
-//
-// NOTE (very important):
-// - This circuit DOES NOT aim to bit-match floating TruthFinder.py.
-// - This circuit IS the project-formal "circuit semantics" TruthFinder version:
-//   fixed Q16 arithmetic + fixed approximation rules + fixed 25 rounds.
-// - A future TruthFinder_circuit_ref.py must use the SAME piecewise boundaries and
-//   coefficients defined below, so Python reference and circuit stay aligned.
-//
-// Project-fixed contract:
-//   M=4, K_MAX=15, N_MAX=12, ITER_N=25, Q16=65536
-//   ITER_N is fixed by project policy (not runtime-variable in this circuit).
-//
-// Input format consumes truthfinder_circom_input.json produced by
-// prepare_circom_input.py (already expanded/flattened/validated by Python pipeline).
-//
-// Flatten index restore (must stay consistent with prepare_circom_input.py):
-//   support_flat[o,f,w] => ((o*N_MAX)+f)*M + w      (order: o -> f -> w)
-//   imp_flat[o,g,f]     => ((o*N_MAX)+g)*N_MAX + f  (order: o -> g -> f)
-//   conf_flat[o,g,f]    => ((o*N_MAX)+g)*N_MAX + f  (order: o -> g -> f)
-//   top1_choice_flat    => o*M + w                  (order: o -> w)
-//
-// top1_choice_flat role:
-//   top1_choice is only used off-circuit to derive dep_avg (Python side).
-//   This circuit's core computation consumes dep_avg directly.
-//   top1_choice_flat is kept only for input-contract compatibility, not used in constraints.
-//
-// Tie-break policy (stable and explicit):
-//   - model argmax: equal score => smaller model index wins.
-//   - fact argmax:  equal score => smaller fact index wins.
-// -----------------------------------------------------------------------------
-
 var Q16 = 65536;
 var M = 4;
 var K_MAX = 15;
@@ -279,7 +246,7 @@ template ApproxTauQ16() {
 }
 
 
-template ApproxSigmoidQ16Signed() {
+template ApproxSigmoidQ16Signed() {␊
     // Formal _sigmoid_circuit (Approximation Spec Freeze v1), signed input.
     //
     // Because field arithmetic is unsigned, signed x is represented as:
@@ -287,6 +254,8 @@ template ApproxSigmoidQ16Signed() {
     //   x_is_zero marks x==0 to select exact midpoint output 32768.
     //
     // Frozen boundaries/coefficients MUST be mirrored in TruthFinder_circuit_ref.py.
+    // Boundary ownership is frozen exactly as spec:
+    //   x=-1/-2/-4/-6 -> S3/S2/S1/S0, x=+1/+2/+4/+6 -> S5/S6/S7/S8.
     signal input x_abs;
     signal input x_is_neg;
     signal input x_is_zero;
@@ -297,34 +266,65 @@ template ApproxSigmoidQ16Signed() {
     x_is_neg * x_is_zero === 0;
 
     // |x| boundaries: 1,2,4,6 in Q16 units
-    component lt1 = LessThan(32); // < 65536
+    component lt1 = LessThan(32); // |x| < 1
     lt1.in[0] <== x_abs;
     lt1.in[1] <== 65536;
 
-    component lt2 = LessThan(32); // < 131072
+    component lt2 = LessThan(32); // |x| < 2
     lt2.in[0] <== x_abs;
     lt2.in[1] <== 131072;
 
-    component lt4 = LessThan(32); // < 262144
+    component lt4 = LessThan(32); // |x| < 4
     lt4.in[0] <== x_abs;
     lt4.in[1] <== 262144;
 
-    component lt6 = LessThan(32); // < 393216
+    component lt6 = LessThan(32); // |x| < 6
     lt6.in[0] <== x_abs;
     lt6.in[1] <== 393216;
 
-    // interval gates over |x|
-    signal gA; // [0,1)
-    signal gB; // [1,2)
-    signal gC; // [2,4)
-    signal gD; // [4,6)
-    signal gE; // [6,+inf)
+    component le1 = LessThan(32); // |x| <= 1
+    le1.in[0] <== x_abs;
+    le1.in[1] <== 65537;
 
-    gA <== lt1.out;
-    gB <== lt2.out - lt1.out;
-    gC <== lt4.out - lt2.out;
-    gD <== lt6.out - lt4.out;
-    gE <== 1 - lt6.out;
+    component le2 = LessThan(32); // |x| <= 2
+    le2.in[0] <== x_abs;
+    le2.in[1] <== 131073;
+
+    component le4 = LessThan(32); // |x| <= 4
+    le4.in[0] <== x_abs;
+    le4.in[1] <== 262145;
+
+    component le6 = LessThan(32); // |x| <= 6
+    le6.in[0] <== x_abs;
+    le6.in[1] <== 393217;
+
+    // interval gates over |x| for negative branch:
+    // S4:(0,1), S3:[1,2), S2:[2,4), S1:[4,6), S0:[6,+inf)
+    signal gNegA;
+    signal gNegB;
+    signal gNegC;
+    signal gNegD;
+    signal gNegE;
+
+    gNegA <== lt1.out;
+    gNegB <== lt2.out - lt1.out;
+    gNegC <== lt4.out - lt2.out;
+    gNegD <== lt6.out - lt4.out;
+    gNegE <== 1 - lt6.out;
+
+    // interval gates over |x| for positive branch:
+    // S5:(0,1], S6:(1,2], S7:(2,4], S8:(4,6], S9:(6,+inf)
+    signal gPosA;
+    signal gPosB;
+    signal gPosC;
+    signal gPosD;
+    signal gPosE;
+
+    gPosA <== le1.out;
+    gPosB <== le2.out - le1.out;
+    gPosC <== le4.out - le2.out;
+    gPosD <== le6.out - le4.out;
+    gPosE <== 1 - le6.out;
 
     // precompute floor(c*|x|/65536)
     component m508 = Q16Mul();
@@ -344,11 +344,11 @@ template ApproxSigmoidQ16Signed() {
     // S3: (-2,-1]       -> 27439 - floor(9813*|x|/65536)
     // S4: (-1,0]        -> 32768 - floor(15143*|x|/65536)
     signal yNeg;
-    yNeg <== gE * 162
-          + gD * (3212 - m508.out)
-          + gC * (14445 - m3317.out)
-          + gB * (27439 - m9813.out)
-          + gA * (32768 - m15143.out);
+    yNeg <== gNegE * 162
+          + gNegD * (3212 - m508.out)
+          + gNegC * (14445 - m3317.out)
+          + gNegB * (27439 - m9813.out)
+          + gNegA * (32768 - m15143.out);
 
     // positive branch:
     // S9: x>=6          -> 65374
@@ -357,11 +357,11 @@ template ApproxSigmoidQ16Signed() {
     // S6: (1,2]         -> floor(9813*x/65536)+38097
     // S5: (0,1]         -> floor(15143*x/65536)+32768
     signal yPos;
-    yPos <== gE * 65374
-          + gD * (62324 + m508.out)
-          + gC * (51091 + m3317.out)
-          + gB * (38097 + m9813.out)
-          + gA * (32768 + m15143.out);
+    yPos <== gPosE * 65374
+          + gPosD * (62324 + m508.out)
+          + gPosC * (51091 + m3317.out)
+          + gPosB * (38097 + m9813.out)
+          + gPosA * (32768 + m15143.out);
 
     // x==0 exact midpoint 32768; otherwise choose sign branch.
     signal yNoZero;
@@ -371,12 +371,12 @@ template ApproxSigmoidQ16Signed() {
     yRaw <== x_is_zero * 32768 + (1 - x_is_zero) * yNoZero;
 
     // Final clamp to [0,65536] upper bound (piecewise formula is already non-negative).
-    component le1 = LessThan(32);
-    le1.in[0] <== yRaw;
-    le1.in[1] <== 65537;
-
-    y <== 65536 + le1.out * (yRaw - 65536);
-}
+    component yLe1 = LessThan(32);
+    yLe1.in[0] <== yRaw;
+    yLe1.in[1] <== 65537;
+␊
+    y <== 65536 + yLe1.out * (yRaw - 65536);
+}␊
 
 template TruthFinderRound() {
     // One round update: (t_in, s_prev) -> (t_out, s_out)
@@ -402,6 +402,7 @@ template TruthFinderRound() {
     signal output s_out[K_MAX][N_MAX];
 
     signal tauW[M];
+
 
     // tau and dependency damping
     for (var w = 0; w < M; w++) {
