@@ -2,6 +2,16 @@ pragma circom 2.2.3;
 
 include "circomlib/circuits/comparators.circom";
 
+// Project freeze note (semantics-first):
+// - This circuit is the formal frozen TruthFinder circuit semantics, not a bit-match
+//   floating implementation of TruthFinder.py.
+// - It uses fixed Q16 arithmetic, frozen _tau_circuit (ApproxTauQ16), and frozen
+//   _sigmoid_circuit (ApproxSigmoidQ16Signed).
+// - For _sigmoid_circuit on the negative half-axis, the official frozen definition is:
+//     y = d - floor((c * |x|) / 65536)
+//   (not an alternative signed-floor/secant interpretation).
+// - Future TruthFinder_circuit_ref.py implementations MUST match this circuit version exactly.
+
 var Q16 = 65536;
 var M = 4;
 var K_MAX = 15;
@@ -246,16 +256,31 @@ template ApproxTauQ16() {
 }
 
 
-template ApproxSigmoidQ16Signed() {␊
-    // Formal _sigmoid_circuit (Approximation Spec Freeze v1), signed input.
+template ApproxSigmoidQ16Signed() {
+    // Formal frozen _sigmoid_circuit (Approximation Spec Freeze v1), signed input.
     //
-    // Because field arithmetic is unsigned, signed x is represented as:
+    // This implementation is the project official frozen spec and MUST be mirrored
+    // exactly in future TruthFinder_circuit_ref.py (do not reinterpret with another
+    // signed-floor/secant formula).
+    //
+    // Signed x is represented as:
     //   x = sign ? (-x_abs) : (+x_abs), where x_abs >= 0 and sign in {0,1}.
-    //   x_is_zero marks x==0 to select exact midpoint output 32768.
+    //   x_is_zero marks x==0 and MUST output exact midpoint 32768.
     //
-    // Frozen boundaries/coefficients MUST be mirrored in TruthFinder_circuit_ref.py.
-    // Boundary ownership is frozen exactly as spec:
-    //   x=-1/-2/-4/-6 -> S3/S2/S1/S0, x=+1/+2/+4/+6 -> S5/S6/S7/S8.
+    // Official frozen piecewise semantics:
+    // - Negative half-axis uses: y = d - floor((c * |x|) / 65536).
+    // - Positive half-axis uses: y = floor((c * x) / 65536) + d.
+    //
+    // Frozen boundary ownership (must match Python reference item-by-item):
+    //   x=-6 -> left saturation segment
+    //   x=-4 -> (-6,-4]
+    //   x=-2 -> (-4,-2]
+    //   x=-1 -> (-2,-1]
+    //   x= 0 -> midpoint 32768
+    //   x= 1 -> (0,1]
+    //   x= 2 -> (1,2]
+    //   x= 4 -> (2,4]
+    //   x= 6 -> (4,6]
     signal input x_abs;
     signal input x_is_neg;
     signal input x_is_zero;
@@ -339,7 +364,7 @@ template ApproxSigmoidQ16Signed() {␊
 
     // negative branch:
     // S0: x<=-6         -> 162
-    // S1: (-6,-4]       ->  floor( 508*x/65536)+3212 = 3212 - floor(508*|x|/65536)
+    // S1: (-6,-4]       -> 3212 - floor( 508*|x|/65536)
     // S2: (-4,-2]       -> 14445 - floor(3317*|x|/65536)
     // S3: (-2,-1]       -> 27439 - floor(9813*|x|/65536)
     // S4: (-1,0]        -> 32768 - floor(15143*|x|/65536)
@@ -374,9 +399,9 @@ template ApproxSigmoidQ16Signed() {␊
     component yLe1 = LessThan(32);
     yLe1.in[0] <== yRaw;
     yLe1.in[1] <== 65537;
-␊
+
     y <== 65536 + yLe1.out * (yRaw - 65536);
-}␊
+}
 
 template TruthFinderRound() {
     // One round update: (t_in, s_prev) -> (t_out, s_out)
