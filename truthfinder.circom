@@ -12,14 +12,6 @@ include "circomlib/circuits/comparators.circom";
 //   (not an alternative signed-floor/secant interpretation).
 // - Future TruthFinder_circuit_ref.py implementations MUST match this circuit version exactly.
 
-var Q16 = 65536;
-var M = 4;
-var K_MAX = 15;
-var N_MAX = 12;
-var ITER_N = 25;
-var OF = K_MAX * N_MAX; // 180
-
-
 template SumN(N) {
     signal input in[N];
     signal output out;
@@ -34,22 +26,31 @@ template SumN(N) {
 
 
 template Q16Mul() {
-    // out = floor((a*b)/Q16), with 0 <= remainder < Q16
+    var Q16 = 65536;
+
     signal input a;
     signal input b;
     signal output out;
 
+    signal q;
     signal r;
-    a * b === out * Q16 + r;
+
+    q <-- (a * b) \ Q16;
+    r <-- (a * b) % Q16;
+
+    a * b === q * Q16 + r;
 
     component rlt = LessThan(17);
     rlt.in[0] <== r;
     rlt.in[1] <== Q16;
     rlt.out === 1;
+
+    out <== q;
 }
 
 
 template Q16Clamp01() {
+    var Q16 = 65536;
     // Clamp to [0, Q16], assuming non-negative input under this circuit flow.
     signal input in;
     signal output out;
@@ -110,25 +111,27 @@ template MaxWithTieBreak() {
 
 
 template ArgMaxModelWithTieBreak() {
+    var M = 4;
     signal input score[M];
     signal output bestIdx;
     signal output bestScore;
 
     signal bestVal[M];
     signal bestId[M];
+    component mx[M - 1];
 
     bestVal[0] <== score[0];
     bestId[0] <== 0;
 
     for (var i = 1; i < M; i++) {
-        component mx = MaxWithTieBreak();
-        mx.curVal <== bestVal[i - 1];
-        mx.curIdx <== bestId[i - 1];
-        mx.nxtVal <== score[i];
-        mx.nxtIdx <== i;
+        mx[i - 1] = MaxWithTieBreak();
+        mx[i - 1].curVal <== bestVal[i - 1];
+        mx[i - 1].curIdx <== bestId[i - 1];
+        mx[i - 1].nxtVal <== score[i];
+        mx[i - 1].nxtIdx <== i;
 
-        bestVal[i] <== mx.outVal;
-        bestId[i] <== mx.outIdx;
+        bestVal[i] <== mx[i - 1].outVal;
+        bestId[i] <== mx[i - 1].outIdx;
     }
 
     bestIdx <== bestId[M - 1];
@@ -137,25 +140,27 @@ template ArgMaxModelWithTieBreak() {
 
 
 template ArgMaxFactWithTieBreak() {
+    var N_MAX = 12;
     signal input score[N_MAX];
     signal output bestIdx;
     signal output bestScore;
 
     signal bestVal[N_MAX];
     signal bestId[N_MAX];
+    component mx[N_MAX - 1];
 
     bestVal[0] <== score[0];
     bestId[0] <== 0;
 
     for (var i = 1; i < N_MAX; i++) {
-        component mx = MaxWithTieBreak();
-        mx.curVal <== bestVal[i - 1];
-        mx.curIdx <== bestId[i - 1];
-        mx.nxtVal <== score[i];
-        mx.nxtIdx <== i;
+        mx[i - 1] = MaxWithTieBreak();
+        mx[i - 1].curVal <== bestVal[i - 1];
+        mx[i - 1].curIdx <== bestId[i - 1];
+        mx[i - 1].nxtVal <== score[i];
+        mx[i - 1].nxtIdx <== i;
 
-        bestVal[i] <== mx.outVal;
-        bestId[i] <== mx.outIdx;
+        bestVal[i] <== mx[i - 1].outVal;
+        bestId[i] <== mx[i - 1].outIdx;
     }
 
     bestIdx <== bestId[N_MAX - 1];
@@ -404,6 +409,11 @@ template ApproxSigmoidQ16Signed() {
 }
 
 template TruthFinderRound() {
+    var M = 4;
+    var K_MAX = 15;
+    var N_MAX = 12;
+    var Q16 = 65536;
+    var OF = K_MAX * N_MAX;
     // One round update: (t_in, s_prev) -> (t_out, s_out)
     // Inputs use fixed flattened arrays and Q16 semantics.
     signal input t_in[M];
@@ -427,154 +437,182 @@ template TruthFinderRound() {
     signal output s_out[K_MAX][N_MAX];
 
     signal tauW[M];
+    signal oneMinus[M];
+    signal scaleW[M];
+    component tauApprox[M];
+    component gmul[M];
+    component ltScale[M];
+    component damp[M];
 
+    signal baseTerms[K_MAX][N_MAX][M];
+    component bm[K_MAX][N_MAX][M];
+    component baseSum[K_MAX][N_MAX];
+
+    signal impTerms[K_MAX][N_MAX][N_MAX];
+    signal confTerms[K_MAX][N_MAX][N_MAX];
+    component im[K_MAX][N_MAX][N_MAX];
+    component cm[K_MAX][N_MAX][N_MAX];
+    component impSum[K_MAX][N_MAX];
+    component confSum[K_MAX][N_MAX];
+    component impScaled[K_MAX][N_MAX];
+    component confScaled[K_MAX][N_MAX];
+    signal preScore[K_MAX][N_MAX];
+    component negFlag[K_MAX][N_MAX];
+    signal scoreAbs[K_MAX][N_MAX];
+    component betaMul[K_MAX][N_MAX];
+    component xZero[K_MAX][N_MAX];
+    component sig[K_MAX][N_MAX];
+    component factValid[K_MAX][N_MAX];
+    signal mask[K_MAX][N_MAX];
+
+    signal numTerms[M][OF];
+    signal denTerms[M][OF];
+    component nm[M][OF];
+    component numSum[M];
+    component denSum[M];
+    component div[M];
+    component tClamp[M];
 
     // tau and dependency damping
     for (var w = 0; w < M; w++) {
-        component tauApprox = ApproxTauQ16();
-        tauApprox.t <== t_in[w];
+        tauApprox[w] = ApproxTauQ16();
+        tauApprox[w].t <== t_in[w];
 
-        component gmul = Q16Mul();
-        gmul.a <== gamma;
-        gmul.b <== dep_avg[w];
+        gmul[w] = Q16Mul();
+        gmul[w].a <== gamma;
+        gmul[w].b <== dep_avg[w];
 
-        signal oneMinus;
-        oneMinus <== Q16 - gmul.out;
+        oneMinus[w] <== Q16 - gmul[w].out;
 
-        component ltScale = LessThan(32);
-        ltScale.in[0] <== oneMinus;
-        ltScale.in[1] <== min_tau_scale;
+        ltScale[w] = LessThan(32);
+        ltScale[w].in[0] <== oneMinus[w];
+        ltScale[w].in[1] <== min_tau_scale;
 
-        signal scaleW;
-        scaleW <== oneMinus + ltScale.out * (min_tau_scale - oneMinus);
+        scaleW[w] <== oneMinus[w] + ltScale[w].out * (min_tau_scale - oneMinus[w]);
 
-        component damp = Q16Mul();
-        damp.a <== tauApprox.tau;
-        damp.b <== scaleW;
-        tauW[w] <== damp.out;
+        damp[w] = Q16Mul();
+        damp[w].a <== tauApprox[w].tau;
+        damp[w].b <== scaleW[w];
+        tauW[w] <== damp[w].out;
     }
 
     // update s
     for (var o = 0; o < K_MAX; o++) {
         for (var f = 0; f < N_MAX; f++) {
-            signal baseTerms[M];
             for (var w2 = 0; w2 < M; w2++) {
                 var sIdx = ((o * N_MAX) + f) * M + w2;
-                component bm = Q16Mul();
-                bm.a <== tauW[w2];
-                bm.b <== support_flat[sIdx];
-                baseTerms[w2] <== bm.out;
+                bm[o][f][w2] = Q16Mul();
+                bm[o][f][w2].a <== tauW[w2];
+                bm[o][f][w2].b <== support_flat[sIdx];
+                baseTerms[o][f][w2] <== bm[o][f][w2].out;
             }
-            component baseSum = SumN(M);
+            baseSum[o][f] = SumN(M);
             for (var w3 = 0; w3 < M; w3++) {
-                baseSum.in[w3] <== baseTerms[w3];
+                baseSum[o][f].in[w3] <== baseTerms[o][f][w3];
             }
 
-            signal impTerms[N_MAX];
-            signal confTerms[N_MAX];
             for (var g = 0; g < N_MAX; g++) {
                 var mIdx = ((o * N_MAX) + g) * N_MAX + f;
 
-                component im = Q16Mul();
-                im.a <== imp_flat[mIdx];
-                im.b <== s_prev[o][g];
-                impTerms[g] <== im.out;
+                im[o][f][g] = Q16Mul();
+                im[o][f][g].a <== imp_flat[mIdx];
+                im[o][f][g].b <== s_prev[o][g];
+                impTerms[o][f][g] <== im[o][f][g].out;
 
-                component cm = Q16Mul();
-                cm.a <== conf_flat[mIdx];
-                cm.b <== s_prev[o][g];
-                confTerms[g] <== cm.out;
+                cm[o][f][g] = Q16Mul();
+                cm[o][f][g].a <== conf_flat[mIdx];
+                cm[o][f][g].b <== s_prev[o][g];
+                confTerms[o][f][g] <== cm[o][f][g].out;
             }
 
-            component impSum = SumN(N_MAX);
-            component confSum = SumN(N_MAX);
+            impSum[o][f] = SumN(N_MAX);
+            confSum[o][f] = SumN(N_MAX);
             for (var g2 = 0; g2 < N_MAX; g2++) {
-                impSum.in[g2] <== impTerms[g2];
-                confSum.in[g2] <== confTerms[g2];
+                impSum[o][f].in[g2] <== impTerms[o][f][g2];
+                confSum[o][f].in[g2] <== confTerms[o][f][g2];
             }
 
-            component impScaled = Q16Mul();
-            impScaled.a <== alpha_imp;
-            impScaled.b <== impSum.out;
+            impScaled[o][f] = Q16Mul();
+            impScaled[o][f].a <== alpha_imp;
+            impScaled[o][f].b <== impSum[o][f].out;
 
-            component confScaled = Q16Mul();
-            confScaled.a <== alpha_conflict;
-            confScaled.b <== confSum.out;
+            confScaled[o][f] = Q16Mul();
+            confScaled[o][f].a <== alpha_conflict;
+            confScaled[o][f].b <== confSum[o][f].out;
 
-            signal preScore;
-            preScore <== baseSum.out + impScaled.out;
+            preScore[o][f] <== baseSum[o][f].out + impScaled[o][f].out;
 
-            component negFlag = LessThan(32);
-            negFlag.in[0] <== preScore;
-            negFlag.in[1] <== confScaled.out;
+            negFlag[o][f] = LessThan(32);
+            negFlag[o][f].in[0] <== preScore[o][f];
+            negFlag[o][f].in[1] <== confScaled[o][f].out;
 
             // signed score = preScore - confScaled.out
             // represented as sign + absolute magnitude for circuit-safe signed sigmoid.
-            signal scoreAbs;
-            scoreAbs <== (preScore - confScaled.out) * (1 - negFlag.out)
-                      + (confScaled.out - preScore) * negFlag.out;
+            scoreAbs[o][f] <== (preScore[o][f] - confScaled[o][f].out) * (1 - negFlag[o][f].out)
+                            + (confScaled[o][f].out - preScore[o][f]) * negFlag[o][f].out;
 
-            component betaMul = Q16Mul();
-            betaMul.a <== beta;
-            betaMul.b <== scoreAbs;
+            betaMul[o][f] = Q16Mul();
+            betaMul[o][f].a <== beta;
+            betaMul[o][f].b <== scoreAbs[o][f];
 
-            component xZero = IsZero();
-            xZero.in <== betaMul.out;
+            xZero[o][f] = IsZero();
+            xZero[o][f].in <== betaMul[o][f].out;
 
-            component sig = ApproxSigmoidQ16Signed();
-            sig.x_abs <== betaMul.out;
-            sig.x_is_neg <== negFlag.out;
-            sig.x_is_zero <== xZero.out;
+            sig[o][f] = ApproxSigmoidQ16Signed();
+            sig[o][f].x_abs <== betaMul[o][f].out;
+            sig[o][f].x_is_neg <== negFlag[o][f].out;
+            sig[o][f].x_is_zero <== xZero[o][f].out;
 
             // keep only valid facts for effective objects
-            component factValid = LessThan(8);
-            factValid.in[0] <== f;
-            factValid.in[1] <== fact_count_by_object[o];
+            factValid[o][f] = LessThan(8);
+            factValid[o][f].in[0] <== f;
+            factValid[o][f].in[1] <== fact_count_by_object[o];
 
-            signal mask;
-            mask <== is_effective_by_object[o] * factValid.out;
+            mask[o][f] <== is_effective_by_object[o] * factValid[o][f].out;
 
-            s_out[o][f] <== sig.y * mask;
+            s_out[o][f] <== sig[o][f].y * mask[o][f];
         }
     }
 
     // update t as weighted average of s over support
     for (var w4 = 0; w4 < M; w4++) {
-        signal numTerms[OF];
-        signal denTerms[OF];
-
         for (var p = 0; p < OF; p++) {
             var o2 = p / N_MAX;
             var f2 = p % N_MAX;
             var idx2 = ((o2 * N_MAX) + f2) * M + w4;
 
-            component nm = Q16Mul();
-            nm.a <== support_flat[idx2];
-            nm.b <== s_out[o2][f2];
-            numTerms[p] <== nm.out;
-            denTerms[p] <== support_flat[idx2];
+            nm[w4][p] = Q16Mul();
+            nm[w4][p].a <== support_flat[idx2];
+            nm[w4][p].b <== s_out[o2][f2];
+            numTerms[w4][p] <== nm[w4][p].out;
+            denTerms[w4][p] <== support_flat[idx2];
         }
 
-        component numSum = SumN(OF);
-        component denSum = SumN(OF);
+        numSum[w4] = SumN(OF);
+        denSum[w4] = SumN(OF);
         for (var p2 = 0; p2 < OF; p2++) {
-            numSum.in[p2] <== numTerms[p2];
-            denSum.in[p2] <== denTerms[p2];
+            numSum[w4].in[p2] <== numTerms[w4][p2];
+            denSum[w4].in[p2] <== denTerms[w4][p2];
         }
 
-        component div = SafeDivNonNeg();
-        div.num <== numSum.out;
-        div.den <== denSum.out;
-        div.fallback <== t_in[w4];
+        div[w4] = SafeDivNonNeg();
+        div[w4].num <== numSum[w4].out;
+        div[w4].den <== denSum[w4].out;
+        div[w4].fallback <== t_in[w4];
 
-        component tClamp = Q16Clamp01();
-        tClamp.in <== div.out;
-        t_out[w4] <== tClamp.out;
+        tClamp[w4] = Q16Clamp01();
+        tClamp[w4].in <== div[w4].out;
+        t_out[w4] <== tClamp[w4].out;
     }
 }
 
 
 template TruthFinderMain() {
+    var M = 4;
+    var K_MAX = 15;
+    var N_MAX = 12;
+    var ITER_N = 25;
+    var Q16 = 65536;
     // ---------------- Inputs (from truthfinder_circom_input.json) ----------------
     signal input K;
 
@@ -610,31 +648,41 @@ template TruthFinderMain() {
 
     // ---------------- Metadata consistency constraints ----------------
     component kBound = LessThan(8);
+    component oLtK[K_MAX];
+    component fcBound[K_MAX];
+    component fcZero[K_MAX];
+    component geM[M];
+    component winnerLtCount[K_MAX];
+    component fValid[K_MAX][N_MAX];
+    component geF[K_MAX][N_MAX];
+
+    signal mustHold[K_MAX][N_MAX];
+
     kBound.in[0] <== K;
     kBound.in[1] <== K_MAX + 1;
     kBound.out === 1;
 
     for (var o = 0; o < K_MAX; o++) {
-        component oLtK = LessThan(8);
-        oLtK.in[0] <== o;
-        oLtK.in[1] <== K;
+        oLtK[o] = LessThan(8);
+        oLtK[o].in[0] <== o;
+        oLtK[o].in[1] <== K;
 
         // Required by spec:
         // o < K  => is_effective=1
         // o >= K => is_effective=0
-        is_effective_by_object[o] === oLtK.out;
+        is_effective_by_object[o] === oLtK[o].out;
 
-        component fcBound = LessThan(8);
-        fcBound.in[0] <== fact_count_by_object[o];
-        fcBound.in[1] <== N_MAX + 1;
-        fcBound.out === 1;
+        fcBound[o] = LessThan(8);
+        fcBound[o].in[0] <== fact_count_by_object[o];
+        fcBound[o].in[1] <== N_MAX + 1;
+        fcBound[o].out === 1;
 
-        component fcZero = IsZero();
-        fcZero.in <== fact_count_by_object[o];
+        fcZero[o] = IsZero();
+        fcZero[o].in <== fact_count_by_object[o];
 
         // Effective object must have at least one fact.
         // is_effective=1 => fact_count != 0
-        is_effective_by_object[o] * fcZero.out === 0;
+        is_effective_by_object[o] * fcZero[o].out === 0;
 
         // Padding object must have fact_count = 0.
         // (1-is_effective)=1 => fact_count == 0
@@ -714,10 +762,10 @@ template TruthFinderMain() {
 
     // Explicitly enforce best_model_score >= all model scores.
     for (var w6 = 0; w6 < M; w6++) {
-        component geM = LessThan(32);
-        geM.in[0] <== t_state[ITER_N][w6];
-        geM.in[1] <== best_model_score_q16 + 1;
-        geM.out === 1;
+        geM[w6] = LessThan(32);
+        geM[w6].in[0] <== t_state[ITER_N][w6];
+        geM[w6].in[1] <== best_model_score_q16 + 1;
+        geM[w6].out === 1;
     }
 
     // ---------------- fact argmax per object + formal constraints ----------------
@@ -735,25 +783,24 @@ template TruthFinderMain() {
         winning_fact_idx_by_object[o6] * (1 - is_effective_by_object[o6]) === 0;
 
         // effective object winner index must be < fact_count
-        component winnerLtCount = LessThan(8);
-        winnerLtCount.in[0] <== winning_fact_idx_by_object[o6];
-        winnerLtCount.in[1] <== fact_count_by_object[o6];
-        is_effective_by_object[o6] * (1 - winnerLtCount.out) === 0;
+        winnerLtCount[o6] = LessThan(8);
+        winnerLtCount[o6].in[0] <== winning_fact_idx_by_object[o6];
+        winnerLtCount[o6].in[1] <== fact_count_by_object[o6];
+        is_effective_by_object[o6] * (1 - winnerLtCount[o6].out) === 0;
 
         // explicit max-score constraints against all valid facts
         for (var f5 = 0; f5 < N_MAX; f5++) {
-            component fValid = LessThan(8);
-            fValid.in[0] <== f5;
-            fValid.in[1] <== fact_count_by_object[o6];
+            fValid[o6][f5] = LessThan(8);
+            fValid[o6][f5].in[0] <== f5;
+            fValid[o6][f5].in[1] <== fact_count_by_object[o6];
 
-            component geF = LessThan(32);
-            geF.in[0] <== s_state[ITER_N][o6][f5];
-            geF.in[1] <== argF[o6].bestScore + 1;
+            geF[o6][f5] = LessThan(32);
+            geF[o6][f5].in[0] <== s_state[ITER_N][o6][f5];
+            geF[o6][f5].in[1] <== argF[o6].bestScore + 1;
 
             // enforce only on valid facts of effective objects
-            signal mustHold;
-            mustHold <== is_effective_by_object[o6] * fValid.out;
-            mustHold * (1 - geF.out) === 0;
+            mustHold[o6][f5] <== is_effective_by_object[o6] * fValid[o6][f5].out;
+            mustHold[o6][f5] * (1 - geF[o6][f5].out) === 0;
         }
     }
 }
