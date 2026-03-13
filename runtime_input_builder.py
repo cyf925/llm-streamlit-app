@@ -3,18 +3,31 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from TruthFinder import (
+_THIS_FILE = Path(__file__).resolve()
+_ZK_DIR = _THIS_FILE.parent
+_PROJECT_ROOT = _ZK_DIR.parent
+_APP_DIR = _PROJECT_ROOT / "app"
+_DEFAULT_SCHEMA_PATH = _ZK_DIR / "truthfinder_runtime_input_schema.json"
+_DEFAULT_TRUTHFINDER_PATH = _APP_DIR / "TruthFinder.py"
+_DEFAULT_NORMALIZE_PATH = _APP_DIR / "normalize.py"
+_DEFAULT_APP_PATH = _APP_DIR / "app.py"
+
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
+from TruthFinder import (  # type: ignore
     TruthFinderConfig,
     _candidate_weights,
     build_conflict_matrix,
     build_implication_matrix,
     compute_rho_dependency_top1,
 )
-from normalize import normalize_meaning_zh_soft
+from normalize import normalize_meaning_zh_soft  # type: ignore
 
 
 Q16_SCALE = 1 << 16
@@ -170,7 +183,6 @@ def _validate_runtime_input(data: Mapping[str, Any]) -> None:
 
     # support row sum check: for each (o,w) row with any support -> approx 65536
     support_rows: Dict[Tuple[int, int], int] = {}
-    model_to_idx = {m: i for i, m in enumerate(model_ids)}
     for patch in data.get("patches", {}).get("support_patch", []) or []:
         o, w = int(patch["o"]), int(patch["w"])
         if o >= k or w >= len(model_ids):
@@ -204,6 +216,57 @@ def _validate_runtime_input(data: Mapping[str, Any]) -> None:
             raise RuntimeInputBuildError(f"conf matrix is not symmetric at object={o}, g={g}, f={f}")
 
 
+def _resolve_schema_path(schema_path: str | Path | None) -> Path:
+    if schema_path is None:
+        return _DEFAULT_SCHEMA_PATH
+
+    p = Path(schema_path)
+    if p.is_absolute():
+        return p
+
+    # 1) relative to current working dir
+    cwd_candidate = p.resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    # 2) relative to zk dir (preferred for this project layout)
+    zk_candidate = (_ZK_DIR / p).resolve()
+    if zk_candidate.exists():
+        return zk_candidate
+
+    return zk_candidate
+
+
+def _resolve_source_path(
+    given: str | Path | None,
+    default_path: Path,
+) -> Path:
+    if given is None:
+        return default_path.resolve()
+
+    p = Path(given)
+    if p.is_absolute():
+        return p
+
+    # 1) relative to cwd
+    cwd_candidate = p.resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    # 2) relative to project root
+    project_candidate = (_PROJECT_ROOT / p).resolve()
+    if project_candidate.exists():
+        return project_candidate
+
+    # 3) relative to zk dir
+    zk_candidate = (_ZK_DIR / p).resolve()
+    if zk_candidate.exists():
+        return zk_candidate
+
+    # final fallback
+    return project_candidate
+
+
 def build_truthfinder_runtime_input_from_state(
     *,
     input_text: str,
@@ -212,7 +275,7 @@ def build_truthfinder_runtime_input_from_state(
     keywords: Sequence[str],
     results: Mapping[str, Mapping[str, Any]],
     cfg: TruthFinderConfig,
-    schema_path: str | Path = "truthfinder_runtime_input_schema.json",
+    schema_path: str | Path | None = None,
     normalized_by_model: Optional[Mapping[str, Mapping[str, Sequence[str]]]] = None,
     model_ids: Optional[Sequence[str]] = None,
     truthfinder_path: str | Path | None = None,
@@ -227,8 +290,15 @@ def build_truthfinder_runtime_input_from_state(
     - top1_choice: stores fact index (not text); -1 means no candidate for that model/object.
     - q16: uses deterministic half-up rounding with scale=65536.
     - hashes: SHA256 over stable JSON serialization (sorted keys + compact separators).
+
+    Path behavior under current project layout:
+    - default schema path: project_root/zk/truthfinder_runtime_input_schema.json
+    - default source hash files:
+        - project_root/app/TruthFinder.py
+        - project_root/app/normalize.py
+        - project_root/app/app.py
     """
-    schema_file = Path(schema_path)
+    schema_file = _resolve_schema_path(schema_path)
     if not schema_file.exists():
         raise FileNotFoundError(f"schema template not found: {schema_file}")
 
@@ -381,10 +451,9 @@ def build_truthfinder_runtime_input_from_state(
     patches["conf_weight_patch"] = conf_patch
 
     # 8) provenance + hashes
-    repo_root = schema_file.parent
-    truthfinder_file = Path(truthfinder_path) if truthfinder_path is not None else (repo_root / "TruthFinder.py")
-    normalize_file = Path(normalize_path) if normalize_path is not None else (repo_root / "normalize.py")
-    app_file = Path(app_path) if app_path is not None else (repo_root / "app.py")
+    truthfinder_file = _resolve_source_path(truthfinder_path, _DEFAULT_TRUTHFINDER_PATH)
+    normalize_file = _resolve_source_path(normalize_path, _DEFAULT_NORMALIZE_PATH)
+    app_file = _resolve_source_path(app_path, _DEFAULT_APP_PATH)
 
     for fp in (truthfinder_file, normalize_file, app_file):
         if not fp.exists():
