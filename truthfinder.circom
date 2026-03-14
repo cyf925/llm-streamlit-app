@@ -74,11 +74,13 @@ template SafeDivNonNeg() {
     component iz = IsZero();
     iz.in <== den;
 
-    signal denEff;
+        signal denEff;
     denEff <== den + iz.out; // if den=0 => 1
 
     signal q;
     signal r;
+    q <-- num \ denEff;
+    r <-- num % denEff;
     num === q * denEff + r;
 
     component rlt = LessThan(32);
@@ -86,7 +88,11 @@ template SafeDivNonNeg() {
     rlt.in[1] <== denEff;
     rlt.out === 1;
 
-    out <== q * (1 - iz.out) + fallback * iz.out;
+       signal qPart;
+    signal fbPart;
+    qPart <== q * (1 - iz.out);
+    fbPart <== fallback * iz.out;
+    out <== qPart + fbPart;
 }
 
 
@@ -249,8 +255,21 @@ template ApproxTauQ16() {
     y4 <== m4.out - 499687;
     y5 <== m5.out - 1024890;
 
+    signal t0;
+    signal t1;
+    signal t2;
+    signal t3;
+    signal t4;
+    signal t5;
     signal raw;
-    raw <== g0 * y0 + g1 * y1 + g2 * y2 + g3 * y3 + g4 * y4 + g5 * y5;
+
+    t0 <== g0 * y0;
+    t1 <== g1 * y1;
+    t2 <== g2 * y2;
+    t3 <== g3 * y3;
+    t4 <== g4 * y4;
+    t5 <== g5 * y5;
+    raw <== t0 + t1 + t2 + t3 + t4 + t5;
 
     // Capped to 262144 (4.0 in Q16), per freeze spec final engineering bound.
     component ltCap = LessThan(32);
@@ -373,12 +392,19 @@ template ApproxSigmoidQ16Signed() {
     // S2: (-4,-2]       -> 14445 - floor(3317*|x|/65536)
     // S3: (-2,-1]       -> 27439 - floor(9813*|x|/65536)
     // S4: (-1,0]        -> 32768 - floor(15143*|x|/65536)
+    signal yNegTerm0;
+    signal yNegTerm1;
+    signal yNegTerm2;
+    signal yNegTerm3;
+    signal yNegTerm4;
     signal yNeg;
-    yNeg <== gNegE * 162
-          + gNegD * (3212 - m508.out)
-          + gNegC * (14445 - m3317.out)
-          + gNegB * (27439 - m9813.out)
-          + gNegA * (32768 - m15143.out);
+
+    yNegTerm0 <== gNegE * 162;
+    yNegTerm1 <== gNegD * (3212 - m508.out);
+    yNegTerm2 <== gNegC * (14445 - m3317.out);
+    yNegTerm3 <== gNegB * (27439 - m9813.out);
+    yNegTerm4 <== gNegA * (32768 - m15143.out);
+    yNeg <== yNegTerm0 + yNegTerm1 + yNegTerm2 + yNegTerm3 + yNegTerm4;
 
     // positive branch:
     // S9: x>=6          -> 65374
@@ -386,19 +412,34 @@ template ApproxSigmoidQ16Signed() {
     // S7: (2,4]         -> floor(3317*x/65536)+51091
     // S6: (1,2]         -> floor(9813*x/65536)+38097
     // S5: (0,1]         -> floor(15143*x/65536)+32768
+    signal yPosTerm0;
+    signal yPosTerm1;
+    signal yPosTerm2;
+    signal yPosTerm3;
+    signal yPosTerm4;
     signal yPos;
-    yPos <== gPosE * 65374
-          + gPosD * (62324 + m508.out)
-          + gPosC * (51091 + m3317.out)
-          + gPosB * (38097 + m9813.out)
-          + gPosA * (32768 + m15143.out);
+
+    yPosTerm0 <== gPosE * 65374;
+    yPosTerm1 <== gPosD * (62324 + m508.out);
+    yPosTerm2 <== gPosC * (51091 + m3317.out);
+    yPosTerm3 <== gPosB * (38097 + m9813.out);
+    yPosTerm4 <== gPosA * (32768 + m15143.out);
+    yPos <== yPosTerm0 + yPosTerm1 + yPosTerm2 + yPosTerm3 + yPosTerm4;
 
     // x==0 exact midpoint 32768; otherwise choose sign branch.
+    signal yNoZeroNeg;
+    signal yNoZeroPos;
     signal yNoZero;
-    yNoZero <== x_is_neg * yNeg + (1 - x_is_neg) * yPos;
+    yNoZeroNeg <== x_is_neg * yNeg;
+    yNoZeroPos <== (1 - x_is_neg) * yPos;
+    yNoZero <== yNoZeroNeg + yNoZeroPos;
 
+    signal yRawZero;
+    signal yRawNonZero;
     signal yRaw;
-    yRaw <== x_is_zero * 32768 + (1 - x_is_zero) * yNoZero;
+    yRawZero <== x_is_zero * 32768;
+    yRawNonZero <== (1 - x_is_zero) * yNoZero;
+    yRaw <== yRawZero + yRawNonZero;
 
     // Final clamp to [0,65536] upper bound (piecewise formula is already non-negative).
     component yLe1 = LessThan(32);
@@ -459,6 +500,8 @@ template TruthFinderRound() {
     signal preScore[K_MAX][N_MAX];
     component negFlag[K_MAX][N_MAX];
     signal scoreAbs[K_MAX][N_MAX];
+    signal scorePosPart[K_MAX][N_MAX];
+    signal scoreNegPart[K_MAX][N_MAX];
     component betaMul[K_MAX][N_MAX];
     component xZero[K_MAX][N_MAX];
     component sig[K_MAX][N_MAX];
@@ -548,8 +591,9 @@ template TruthFinderRound() {
 
             // signed score = preScore - confScaled.out
             // represented as sign + absolute magnitude for circuit-safe signed sigmoid.
-            scoreAbs[o][f] <== (preScore[o][f] - confScaled[o][f].out) * (1 - negFlag[o][f].out)
-                            + (confScaled[o][f].out - preScore[o][f]) * negFlag[o][f].out;
+            scorePosPart[o][f] <== (preScore[o][f] - confScaled[o][f].out) * (1 - negFlag[o][f].out);
+            scoreNegPart[o][f] <== (confScaled[o][f].out - preScore[o][f]) * negFlag[o][f].out;
+            scoreAbs[o][f] <== scorePosPart[o][f] + scoreNegPart[o][f];
 
             betaMul[o][f] = Q16Mul();
             betaMul[o][f].a <== beta;
@@ -577,7 +621,7 @@ template TruthFinderRound() {
     // update t as weighted average of s over support
     for (var w4 = 0; w4 < M; w4++) {
         for (var p = 0; p < OF; p++) {
-            var o2 = p / N_MAX;
+            var o2 = p \ N_MAX;
             var f2 = p % N_MAX;
             var idx2 = ((o2 * N_MAX) + f2) * M + w4;
 
