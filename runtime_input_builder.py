@@ -68,6 +68,50 @@ def _float_to_q16_str(value: float, scale: int = Q16_SCALE) -> str:
     return str(q)
 
 
+
+
+def _normalize_q16_support_row(weights_q16: Sequence[int]) -> List[int]:
+    """
+    Normalize one support row in Q16 by tail-delta adjustment.
+
+    - Empty/all-zero row stays zero-sum (no support for this object/model).
+    - Non-empty row gets a small tail compensation so final sum is exactly 65536.
+    """
+    row = [int(w) for w in weights_q16]
+    if not row:
+        return row
+
+    row_sum = sum(row)
+    if row_sum == 0:
+        return row
+
+    # Q16 integer rounding may introduce 1~few units drift.
+    # For non-empty support rows, apply tail-item compensation so sum(row)==65536,
+    # matching expander/circuit strict row-sum constraints.
+    delta = Q16_SCALE - row_sum
+    if delta == 0:
+        return row
+
+    last_nonzero_idx = -1
+    for i, v in enumerate(row):
+        if v > 0:
+            last_nonzero_idx = i
+
+    target_idx = last_nonzero_idx if last_nonzero_idx >= 0 else len(row) - 1
+    row[target_idx] += delta
+
+    if row[target_idx] < 0:
+        raise RuntimeInputBuildError(
+            f"support row normalization produced negative weight at index={target_idx}: {row[target_idx]}"
+        )
+
+    if sum(row) != Q16_SCALE:
+        raise RuntimeInputBuildError(
+            f"support row normalization failed: expected {Q16_SCALE}, got {sum(row)}"
+        )
+    return row
+
+
 def _extract_kw2raw(rows: Sequence[Mapping[str, Any]]) -> Dict[str, str]:
     kw2raw: Dict[str, str] = {}
     for r in rows:
@@ -405,11 +449,22 @@ def build_truthfinder_runtime_input_from_state(
                 )
 
     # 6) support patch (non-zero only), stable sort o,f,w
-    support_patch = [
-        {"o": o, "f": f, "w": w, "value": _float_to_q16_str(v)}
-        for (o, f, w), v in sorted(support.items(), key=lambda x: (x[0][0], x[0][1], x[0][2]))
-        if v > 0
-    ]
+    # Build per (o,w) rows first, then do Q16 tail-delta normalization for strict row sums.
+    support_by_ow: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    for (o, f, w), v in sorted(support.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        if v <= 0:
+            continue
+        q16_val = int(_float_to_q16_str(v))
+        support_by_ow.setdefault((o, w), []).append((f, q16_val))
+
+    support_patch: List[Dict[str, Any]] = []
+    for (o, w) in sorted(support_by_ow.keys()):
+        row = support_by_ow[(o, w)]
+        row_q16 = [val for _, val in row]
+        row_q16 = _normalize_q16_support_row(row_q16)
+        for (f, _old), q16_val in zip(row, row_q16):
+            if q16_val > 0:
+                support_patch.append({"o": o, "f": f, "w": w, "value": str(q16_val)})
 
     # 7) fill runtime/objects/facts/top1/params
     runtime = data.setdefault("runtime", {})
