@@ -336,6 +336,78 @@ def prepare_circom_input_from_dense(dense_data: Mapping[str, Any]) -> Dict[str, 
     }
 
 
+def build_witness_input_from_circom_input(circom_input: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Build witness-only input payload from full circom input payload.
+
+    The returned dictionary contains only signals that are consumed by
+    `main` in `truthfinder.circom`.
+    """
+    try:
+        params_q16 = circom_input["params_q16"]
+        object_meta = circom_input["object_meta"]
+        circom_arrays = circom_input["circom_arrays"]
+    except KeyError as ex:
+        raise PrepareCircomInputError(f"missing required field in circom input: {ex}") from ex
+
+    if not isinstance(params_q16, Mapping):
+        raise PrepareCircomInputError("circom_input.params_q16 must be an object")
+    if not isinstance(object_meta, Mapping):
+        raise PrepareCircomInputError("circom_input.object_meta must be an object")
+    if not isinstance(circom_arrays, Mapping):
+        raise PrepareCircomInputError("circom_input.circom_arrays must be an object")
+
+    required_params = [
+        "t0",
+        "beta",
+        "gamma",
+        "alpha_imp",
+        "alpha_conflict",
+        "cand_decay",
+        "min_tau_scale",
+    ]
+    required_object_meta = [
+        "fact_count_by_object",
+        "is_effective_by_object",
+        "top1_choice_flat",
+    ]
+    required_circom_arrays = [
+        "K",
+        "dep_avg",
+        "support_flat",
+        "imp_flat",
+        "conf_flat",
+    ]
+
+    for key in required_params:
+        if key not in params_q16:
+            raise PrepareCircomInputError(f"circom_input.params_q16 missing required field: {key}")
+    for key in required_object_meta:
+        if key not in object_meta:
+            raise PrepareCircomInputError(f"circom_input.object_meta missing required field: {key}")
+    for key in required_circom_arrays:
+        if key not in circom_arrays:
+            raise PrepareCircomInputError(f"circom_input.circom_arrays missing required field: {key}")
+
+    return {
+        "K": circom_arrays["K"],
+        "t0": params_q16["t0"],
+        "beta": params_q16["beta"],
+        "gamma": params_q16["gamma"],
+        "alpha_imp": params_q16["alpha_imp"],
+        "alpha_conflict": params_q16["alpha_conflict"],
+        "cand_decay": params_q16["cand_decay"],
+        "min_tau_scale": params_q16["min_tau_scale"],
+        "fact_count_by_object": object_meta["fact_count_by_object"],
+        "is_effective_by_object": object_meta["is_effective_by_object"],
+        "top1_choice_flat": object_meta["top1_choice_flat"],
+        "dep_avg": circom_arrays["dep_avg"],
+        "support_flat": circom_arrays["support_flat"],
+        "imp_flat": circom_arrays["imp_flat"],
+        "conf_flat": circom_arrays["conf_flat"],
+    }
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -355,6 +427,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to write truthfinder_circom_input.json (default: same dir as input)",
     )
+    parser.add_argument(
+        "--witness-output",
+        type=Path,
+        default=None,
+        help="Path to write truthfinder_witness_input.json (default: same dir as circom output)",
+    )
     return parser
 
 
@@ -364,15 +442,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     input_path: Path = args.input
     output_path: Path = args.output or (input_path.parent / "truthfinder_circom_input.json")
+    witness_output_path: Path = args.witness_output or (output_path.parent / "truthfinder_witness_input.json")
 
     if not input_path.exists():
         raise PrepareCircomInputError(f"input file not found: {input_path}")
 
     dense_data = _read_json(input_path)
     circom_data = prepare_circom_input_from_dense(dense_data)
+    witness_data = build_witness_input_from_circom_input(circom_data)
     _write_json(output_path, circom_data)
+    _write_json(witness_output_path, witness_data)
 
     print(f"[prepare_circom_input] wrote circom input: {output_path}")
+    print(f"[prepare_circom_input] wrote witness input: {witness_output_path}")
     return 0
 
 
