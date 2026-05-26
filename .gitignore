@@ -1,0 +1,52 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+conda/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Node
+node_modules/
+
+# Local models / large model files
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# ZK generated or large files
+*.ptau
+*.zkey
+*.wtns
+*.r1cs
+*.sym
+witness.wtns
+proof.json
+public.json
+verification_key.json
+
+# ZK generated directories
+**/zk/build/
+**/zk/circuits/.circom_build_check/
+**/zk/input/

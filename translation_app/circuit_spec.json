@@ -1,0 +1,24 @@
+{
+  "cfg": {
+    "t0": 0.75,
+    "gamma": 0.35,
+    "beta": 0.35,
+    "alpha_imp": 0.25,
+    "alpha_conflict": 0.15
+  },
+  "ITER_N": 25,
+  "K_MAX": 15,
+  "M": 4,
+  "N_MAX": 12,
+  "nonlinear": {
+    "sigmoid_clip": 60,
+    "sigmoid_approx": "poly_degree_5",
+    "tau_approx": "poly_degree_5"
+  },
+  "outputs": {
+    "emit_t_score": true,
+    "emit_best_model_id": true
+  },
+  "Q_BITS": 16,
+  "TOPN_CANDIDATES": 3
+}
